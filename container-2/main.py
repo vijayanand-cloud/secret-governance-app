@@ -28,15 +28,29 @@ _kv            = SecretClient(vault_url=KV_URL, credential=_credential)
 def _kv_get(n: str) -> str:
     return _kv.get_secret(n).value
 
-GRAPH_TENANT_ID     = _kv_get("GRAPH-TENANT-ID")
-GRAPH_CLIENT_ID     = _kv_get("GRAPH-CLIENT-ID")
-GRAPH_CLIENT_SECRET = _kv_get("GRAPH-CLIENT-SECRET")
-JIRA_BASE_URL       = _kv_get("JIRA-BASE-URL")
-JIRA_API_TOKEN      = _kv_get("JIRA-API-TOKEN")
-JIRA_USER_EMAIL     = _kv_get("JIRA-USER-EMAIL")
-TEAMS_WEBHOOK_URL   = _kv_get("TEAMS-WEBHOOK-URL").strip()
-SHAREPOINT_SITE_ID  = _kv_get("SHAREPOINT-SITE-ID")
-SHAREPOINT_LIST_ID  = _kv_get("SHAREPOINT-LIST-ID")
+# Still needed — used for tenant name lookup and TenantID stamping in SharePoint
+GRAPH_TENANT_ID    = _kv_get("GRAPH-TENANT-ID")
+
+# REMOVED — no longer needed, UAMI handles auth
+# GRAPH_CLIENT_ID  = _kv_get("GRAPH-CLIENT-ID")     ← DELETE
+# GRAPH_CLIENT_SECRET = _kv_get("GRAPH-CLIENT-SECRET") ← DELETE
+
+JIRA_BASE_URL      = _kv_get("JIRA-BASE-URL")
+JIRA_API_TOKEN     = _kv_get("JIRA-API-TOKEN")
+JIRA_USER_EMAIL    = _kv_get("JIRA-USER-EMAIL")
+TEAMS_WEBHOOK_URL  = _kv_get("TEAMS-WEBHOOK-URL").strip()
+SHAREPOINT_SITE_ID = _kv_get("SHAREPOINT-SITE-ID")
+SHAREPOINT_LIST_ID = _kv_get("SHAREPOINT-LIST-ID")
+JIRA_PROJECT_KEY   = _kv_get("JIRA-PROJECT-KEY").strip()
+JIRA_EPIC_KEY      = _kv_get("JIRA-EPIC-KEY").strip()
+JIRA_ISSUE_TYPE    = _kv_get("JIRA-ISSUE-TYPE").strip()
+
+# ── Graph token via UAMI (no client secret needed) ────────────────────────────
+_graph_credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
+
+def _graph_token() -> str:
+    token = _graph_credential.get_token("https://graph.microsoft.com/.default")
+    return token.token
 
 try:
     JIRA_PROJECT_KEY = _kv_get("JIRA-PROJECT-KEY").strip()
