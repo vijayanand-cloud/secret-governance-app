@@ -1,0 +1,204 @@
+name: Deploy Secret Governance
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRIGGERS
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  # Auto trigger on push to main branch
+  push:
+    branches:
+      - main
+    paths:
+      - 'container-1/**'
+      - 'container-2/**'
+
+  # Manual trigger — click a button in GitHub
+  workflow_dispatch:
+    inputs:
+      container:
+        description: 'Which container to deploy?'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - container-1
+          - container-2
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PERMISSIONS — required for OIDC authentication (no password needed)
+# ─────────────────────────────────────────────────────────────────────────────
+permissions:
+  id-token: write   # allows GitHub to request OIDC token
+  contents: read    # allows reading the repo code
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENVIRONMENT VARIABLES
+# ─────────────────────────────────────────────────────────────────────────────
+env:
+  ACR_NAME:          acrsecretmonitor0103
+  ACR_LOGIN_SERVER:  acrsecretmonitor0103.azurecr.io
+  CONTAINER_APP:     secret-governance-v2
+  RESOURCE_GROUP:    Foundry-Project
+  IMAGE_1:           secret-governance/langchain-agent
+  IMAGE_2:           secret-governance/monitor-mcp
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOBS
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+
+  # ── Detect what changed (only rebuild what's needed) ─────────────────────
+  detect-changes:
+    name: Detect Changed Containers
+    runs-on: ubuntu-latest
+    outputs:
+      container1: ${{ steps.changes.outputs.container1 }}
+      container2: ${{ steps.changes.outputs.container2 }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changes
+        id: changes
+        run: |
+          # For manual trigger — use the input selection
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SELECTION="${{ github.event.inputs.container }}"
+            if [ "$SELECTION" = "both" ] || [ "$SELECTION" = "container-1" ]; then
+              echo "container1=true" >> $GITHUB_OUTPUT
+            else
+              echo "container1=false" >> $GITHUB_OUTPUT
+            fi
+            if [ "$SELECTION" = "both" ] || [ "$SELECTION" = "container-2" ]; then
+              echo "container2=true" >> $GITHUB_OUTPUT
+            else
+              echo "container2=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            # For push trigger — check which files changed
+            if git diff --name-only HEAD~1 HEAD | grep -q "^container-1/"; then
+              echo "container1=true" >> $GITHUB_OUTPUT
+            else
+              echo "container1=false" >> $GITHUB_OUTPUT
+            fi
+            if git diff --name-only HEAD~1 HEAD | grep -q "^container-2/"; then
+              echo "container2=true" >> $GITHUB_OUTPUT
+            else
+              echo "container2=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+  # ── Build and deploy Container 1 ─────────────────────────────────────────
+  deploy-container-1:
+    name: Build & Deploy Container 1 (LangChain Agent)
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.container1 == 'true'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to Azure via OIDC
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build and push Container 1 to ACR
+        run: |
+          echo "Building Container 1 — LangChain Agent..."
+          az acr build \
+            --registry ${{ env.ACR_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image ${{ env.IMAGE_1 }}:${{ github.sha }} \
+            --image ${{ env.IMAGE_1 }}:latest \
+            ./container-1
+          echo "✓ Container 1 built and pushed"
+
+      - name: Update Container App — Container 1
+        run: |
+          echo "Deploying Container 1 to Container App..."
+          az containerapp update \
+            --name ${{ env.CONTAINER_APP }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --container-name langchain-agent \
+            --image ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_1 }}:${{ github.sha }}
+          echo "✓ Container 1 deployed"
+
+      - name: Verify Container 1 health
+        run: |
+          echo "Waiting 30s for container to start..."
+          sleep 30
+          FQDN=$(az containerapp show \
+            --name ${{ env.CONTAINER_APP }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" -o tsv)
+          echo "Container App URL: https://$FQDN"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://$FQDN/health)
+          if [ "$STATUS" = "200" ]; then
+            echo "✓ Health check passed"
+          else
+            echo "✗ Health check failed — HTTP $STATUS"
+            exit 1
+          fi
+
+  # ── Build and deploy Container 2 ─────────────────────────────────────────
+  deploy-container-2:
+    name: Build & Deploy Container 2 (Monitor API)
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.container2 == 'true'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to Azure via OIDC
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build and push Container 2 to ACR
+        run: |
+          echo "Building Container 2 — Monitor API..."
+          az acr build \
+            --registry ${{ env.ACR_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image ${{ env.IMAGE_2 }}:${{ github.sha }} \
+            --image ${{ env.IMAGE_2 }}:latest \
+            ./container-2
+          echo "✓ Container 2 built and pushed"
+
+      - name: Update Container App — Container 2
+        run: |
+          echo "Deploying Container 2 to Container App..."
+          az containerapp update \
+            --name ${{ env.CONTAINER_APP }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --container-name monitor-mcp \
+            --image ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_2 }}:${{ github.sha }}
+          echo "✓ Container 2 deployed"
+
+  # ── Summary ───────────────────────────────────────────────────────────────
+  summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [detect-changes, deploy-container-1, deploy-container-2]
+    if: always()
+
+    steps:
+      - name: Print summary
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Container | Changed | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Container 1 (LangChain Agent) | ${{ needs.detect-changes.outputs.container1 }} | ${{ needs.deploy-container-1.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Container 2 (Monitor API)     | ${{ needs.detect-changes.outputs.container2 }} | ${{ needs.deploy-container-2.result }} |" >> $GITHUB_STEP_SUMMARY
