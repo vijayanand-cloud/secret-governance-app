@@ -92,11 +92,15 @@ jobs:
           fi
 
   # ── Build and deploy Container 1 ─────────────────────────────────────────
+  # Waits for Container 2 to finish first — prevents ContainerAppOperationInProgress error
   deploy-container-1:
     name: Build & Deploy Container 1 (LangChain Agent)
     runs-on: ubuntu-latest
-    needs: detect-changes
-    if: needs.detect-changes.outputs.container1 == 'true'
+    needs: [detect-changes, deploy-container-2]
+    if: |
+      always() &&
+      needs.detect-changes.outputs.container1 == 'true' &&
+      (needs.deploy-container-2.result == 'success' || needs.deploy-container-2.result == 'skipped')
 
     steps:
       - name: Checkout code
