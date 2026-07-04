@@ -176,6 +176,7 @@ async def run_secret_monitoring(
         "runDate": today,
         "secretsScanned": 0,
         "totalsByBucket": {b: 0 for b in ["B0", "P1", "P2", "P3", "ExpiredManualReview", "Ignore"]},
+        "b0LoggedOnly":      0,   # B0 secrets detected but NOT written to SharePoint
         "newJiraTickets":    0,
         "newTeamsAlerts":    0,
         "jiraComments":      0,
@@ -318,34 +319,13 @@ async def run_secret_monitoring(
             if res.get("teams"):
                 summary["newTeamsAlerts"] += 1
 
-    # ── PHASE 3: Handle B0 new secrets — SP row only, no Jira ────────────────
+    # ── PHASE 3: Handle B0 new secrets — log only, NO SharePoint entry ─────────
     b0_new = [c for c in new_secrets if c["bucket"] == "B0"]
-
-    async def _write_b0(c: dict):
-        try:
-            await write_sharepoint_row(None, {
-                "Title":             c["app_id"],
-                "AppName":           c["app_name"],
-                "SecretID":          c["secret_id"],
-                "SecretDescription": c["secret_desc"],
-                "ExpirationDate":    c["expiration"],
-                "ExpiryNotice":      _expiry_notice(c["days"]),
-                "LastChecked":       today,
-                "ExpiryBucket":      "B0",
-                "AlertStatus":       "Monitoring",
-            })
-            return {"error": None}
-        except Exception as e:
-            return {"error": str(e)}
-
-    b0_results = await _run_batched([_write_b0(c) for c in b0_new], SP_WRITE_BATCH)
-    for res in b0_results:
-        if isinstance(res, Exception):
-            summary["errors"].append(f"B0 write error: {res}")
-        elif res.get("error"):
-            summary["errors"].append(res["error"])
-        else:
-            summary["sharepointCreated"] += 1
+    if b0_new:
+        summary["b0LoggedOnly"] += len(b0_new)
+        print(f"[INFO] B0 secrets (61+ days safe): {len(b0_new)} found — logged only, no SharePoint entry")
+        for c in b0_new[:5]:  # log first 5 for visibility
+            print(f"  B0: {c['app_name']} ({c['app_id']}) — expires in {c['days']} days")
 
     # ── PHASE 4: Handle existing secrets (batched) ────────────────────────────
     async def _process_existing(c: dict, existing: dict):
