@@ -28,29 +28,14 @@ _kv            = SecretClient(vault_url=KV_URL, credential=_credential)
 def _kv_get(n: str) -> str:
     return _kv.get_secret(n).value
 
-# Still needed — used for tenant name lookup and TenantID stamping in SharePoint
 GRAPH_TENANT_ID    = _kv_get("GRAPH-TENANT-ID")
-
-# REMOVED — no longer needed, UAMI handles auth
-# GRAPH_CLIENT_ID  = _kv_get("GRAPH-CLIENT-ID")     ← DELETE
-# GRAPH_CLIENT_SECRET = _kv_get("GRAPH-CLIENT-SECRET") ← DELETE
-
+GRAPH_TENANT_NAME  = _kv_get("GRAPH-TENANT-NAME")  # from KV — no Directory.Read.All needed
 JIRA_BASE_URL      = _kv_get("JIRA-BASE-URL")
-JIRA_API_TOKEN     = _kv_get("JIRA-API-TOKEN")
-JIRA_USER_EMAIL    = _kv_get("JIRA-USER-EMAIL")
-TEAMS_WEBHOOK_URL  = _kv_get("TEAMS-WEBHOOK-URL").strip()
-SHAREPOINT_SITE_ID = _kv_get("SHAREPOINT-SITE-ID")
-SHAREPOINT_LIST_ID = _kv_get("SHAREPOINT-LIST-ID")
-JIRA_PROJECT_KEY   = _kv_get("JIRA-PROJECT-KEY").strip()
-JIRA_EPIC_KEY      = _kv_get("JIRA-EPIC-KEY").strip()
-JIRA_ISSUE_TYPE    = _kv_get("JIRA-ISSUE-TYPE").strip()
-
-# ── Graph token via UAMI (no client secret needed) ────────────────────────────
-_graph_credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
-
-def _graph_token() -> str:
-    token = _graph_credential.get_token("https://graph.microsoft.com/.default")
-    return token.token
+JIRA_API_TOKEN      = _kv_get("JIRA-API-TOKEN")
+JIRA_USER_EMAIL     = _kv_get("JIRA-USER-EMAIL")
+TEAMS_WEBHOOK_URL   = _kv_get("TEAMS-WEBHOOK-URL").strip()
+SHAREPOINT_SITE_ID  = _kv_get("SHAREPOINT-SITE-ID")
+SHAREPOINT_LIST_ID  = _kv_get("SHAREPOINT-LIST-ID")
 
 try:
     JIRA_PROJECT_KEY = _kv_get("JIRA-PROJECT-KEY").strip()
@@ -68,35 +53,18 @@ except Exception:
 log.info(f"Config loaded. Project: {JIRA_PROJECT_KEY} | Epic: {JIRA_EPIC_KEY}")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-_tc: dict[str, Any] = {}
+# UAMI handles Graph auth — no client secret needed
+from azure.identity import ManagedIdentityCredential as _MIC
+_graph_credential = _MIC(client_id=UAMI_CLIENT_ID)
 
 async def _graph_token() -> str:
-    now = datetime.now(timezone.utc).timestamp()
-    if _tc.get("exp", 0) > now + 60:
-        return _tc["tok"]
-    async with httpx.AsyncClient() as c:
-        r = await c.post(
-            f"https://login.microsoftonline.com/{GRAPH_TENANT_ID}/oauth2/v2.0/token",
-            data={"grant_type": "client_credentials", "client_id": GRAPH_CLIENT_ID,
-                  "client_secret": GRAPH_CLIENT_SECRET,
-                  "scope": "https://graph.microsoft.com/.default"},
-            timeout=15)
-        r.raise_for_status()
-        b = r.json()
-    _tc["tok"] = b["access_token"]
-    _tc["exp"] = now + b["expires_in"]
-    return _tc["tok"]
+    """Get Graph API token using UAMI — no client secret required."""
+    token = _graph_credential.get_token("https://graph.microsoft.com/.default")
+    return token.token
 
-_cached_tenant_name = ""
 async def get_tenant_name() -> str:
-    global _cached_tenant_name
-    if _cached_tenant_name: return _cached_tenant_name
-    async with httpx.AsyncClient() as c:
-        r = await c.get("https://graph.microsoft.com/v1.0/organization", headers={"Authorization": f"Bearer {await _graph_token()}"}, timeout=15)
-        if r.is_success and r.json().get("value"):
-            _cached_tenant_name = r.json()["value"][0].get("displayName", "Unknown Tenant")
-            return _cached_tenant_name
-    return "Unknown Tenant"
+    """Returns tenant name from Key Vault — no Graph API call, no extra permissions needed."""
+    return GRAPH_TENANT_NAME
 
 def _jira_auth() -> str:
     return "Basic " + _b64.b64encode(f"{JIRA_USER_EMAIL}:{JIRA_API_TOKEN}".encode()).decode()
