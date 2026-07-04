@@ -201,4 +201,33 @@ async def api_send_teams_alert(req: TeamsReq): return await send_teams_alert(req
 async def api_run_monitoring():
     return await _run_secret_monitoring(fetch_azure_secrets, get_sharepoint_state, write_sharepoint_row, create_jira_ticket, get_jira_issue, add_jira_comment, send_teams_alert)
 
+class JiraCloseReq(BaseModel):
+    jira_key: str
+    today: str
+
+@app.post("/tools/update_on_jira_close")
+async def api_update_on_jira_close(req: JiraCloseReq):
+    """
+    Called directly when a Jira ticket is closed — no AI needed.
+    Finds SharePoint rows with matching JiraTicketKey and marks them as Rotated.
+    """
+    sp_data = await get_sharepoint_state()
+    today   = req.today
+    updated = 0
+
+    for item in sp_data.get("items", []):
+        f = item.get("fields", {})
+        if f.get("JiraTicketKey") == req.jira_key:
+            await write_sharepoint_row(item["id"], {
+                "AlertStatus":          "Rotated",
+                "RotationDetectedDate": today,
+                "ExpiryNotice":         "Rotated — Completed",
+                "LastChecked":          today,
+            })
+            updated += 1
+            log.info("Marked Rotated: item=%s jira=%s", item["id"], req.jira_key)
+
+    log.info("update_on_jira_close: %s rows updated for %s", updated, req.jira_key)
+    return {"updated": updated, "jira_key": req.jira_key}
+
 log.info("REST API Server ready — GET /health | POST /tools/*")

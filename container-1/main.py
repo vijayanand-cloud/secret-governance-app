@@ -2,17 +2,15 @@
 Azure Secret Governance — LangChain Agent  (Container 1)
 =========================================================
 Endpoints:
-  GET  /health   — liveness probe
-  POST /run      — trigger a governance cycle (called by Automation Runbook)
-  POST /chat     — conversational endpoint with per-session memory
-
-Container 2 is now a plain FastAPI REST API (not MCP).
-LangChain tools are defined here as @tool functions that call Container 2's
-/tools/* endpoints over HTTP on localhost:8001.
+  GET  /health        — liveness probe
+  POST /run           — trigger a governance cycle (background task — returns immediately)
+  POST /chat          — conversational endpoint with per-session memory
+  POST /jira-webhook  — Jira automation trigger when ticket is resolved
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -23,7 +21,7 @@ import httpx
 from azure.identity import ManagedIdentityCredential
 from azure.keyvault.secrets import SecretClient
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 from langchain_openai import AzureChatOpenAI
@@ -66,13 +64,13 @@ log.info("Azure OpenAI config loaded. Deployment: %s", AOAI_DEPLOYMENT)
 async def _call_monitor(endpoint: str, payload: dict | None = None) -> dict:
     """POST to a Container 2 /tools/* endpoint and return the JSON response."""
     url = f"{MONITOR_API_URL}/tools/{endpoint}"
-    async with httpx.AsyncClient(timeout=300) as c:
+    async with httpx.AsyncClient(timeout=1800) as c:
         r = await c.post(url, json=payload or {})
         r.raise_for_status()
         return r.json()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LANGCHAIN TOOLS — thin wrappers around Container 2 REST endpoints
+# LANGCHAIN TOOLS
 # ─────────────────────────────────────────────────────────────────────────────
 
 @tool
@@ -167,9 +165,17 @@ Guidelines:
 - For a full monitoring cycle, call run_secret_monitoring().
 - For specific questions ("What is the status of KAN-96?", "Show secrets for App X"),
   use the targeted individual tools rather than the full cycle.
-- Rotation is handled automatically by a separate Azure Automation Runbook — inform
-  users of this if they ask about rotation.
+- When a Jira ticket is closed, verify the SharePoint row and update AlertStatus to Rotated.
+- Rotation is handled automatically by a separate Azure Automation Runbook.
 - Always respond in clear, well-formatted Markdown with ticket keys, dates, and counts.
+
+Bucket classifications (use these exactly when reporting):
+- P1: 0-7 days remaining (CRITICAL)
+- P2: 8-30 days remaining (WARNING)
+- P3: 31-60 days remaining (INFORMATION)
+- B0: 61+ days remaining (SAFE)
+- ExpiredManualReview: expired 1-7 days ago (MANUAL REVIEW)
+- Ignore: expired 8+ days ago (SKIPPED)
 """
 
 DEFAULT_INSTRUCTION = (
@@ -200,7 +206,7 @@ def build_agent() -> RunnableWithMessageHistory:
         MessagesPlaceholder(variable_name="agent_scratchpad"),
     ])
     agent    = create_tool_calling_agent(llm, TOOLS, prompt)
-    executor = AgentExecutor(agent=agent, tools=TOOLS, verbose=True, max_iterations=15)
+    executor = AgentExecutor(agent=agent, tools=TOOLS, verbose=True, max_iterations=30)
     return RunnableWithMessageHistory(
         executor,
         get_session_history,
@@ -221,11 +227,13 @@ async def _get_agent() -> RunnableWithMessageHistory:
 async def run_governance_cycle(instruction: str = DEFAULT_INSTRUCTION) -> dict:
     agent   = await _get_agent()
     started = datetime.now(timezone.utc)
+    log.info("Governance cycle started at %s", started.isoformat())
     try:
         result = await agent.ainvoke(
             {"input": instruction},
             config={"configurable": {"session_id": "runbook_trigger"}},
         )
+        log.info("Governance cycle completed successfully")
         return {
             "success":   True,
             "startedAt": started.isoformat(),
@@ -248,6 +256,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Azure Secret Governance Agent", lifespan=lifespan)
 
+# ── Request models ────────────────────────────────────────────────────────────
+
 class RunRequest(BaseModel):
     instruction: str | None = None
 
@@ -255,14 +265,29 @@ class ChatRequest(BaseModel):
     message: str
     session_id: str = "default_user_session"
 
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "server": "AzureSecretGovernanceAgent", "deployment": AOAI_DEPLOYMENT}
+    return {
+        "status": "ok",
+        "server": "AzureSecretGovernanceAgent",
+        "deployment": AOAI_DEPLOYMENT
+    }
 
 @app.post("/run")
 async def run(req: RunRequest):
-    """Trigger a monitoring governance cycle. Called by the Azure Automation Runbook."""
-    return await run_governance_cycle(req.instruction or DEFAULT_INSTRUCTION)
+    """
+    Fires the monitoring cycle as a background task and returns immediately.
+    Prevents 504/timeout errors on the runbook side.
+    """
+    instruction = req.instruction or DEFAULT_INSTRUCTION
+    asyncio.create_task(run_governance_cycle(instruction))
+    return {
+        "success":   True,
+        "message":   "Monitoring cycle started in background",
+        "startedAt": datetime.now(timezone.utc).isoformat(),
+    }
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
@@ -277,3 +302,62 @@ async def chat(req: ChatRequest):
     except Exception as e:
         log.exception("Chat request failed for session %s", req.session_id)
         raise HTTPException(status_code=500, detail=str(e))
+
+async def _update_sharepoint_on_close(jira_key: str):
+    """
+    Directly updates SharePoint when a Jira ticket closes.
+    No AI/LangChain needed — direct Container 2 API call.
+    Fast, reliable, zero rate limit risk.
+    """
+    try:
+        today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        result = await _call_monitor("update_on_jira_close", {
+            "jira_key": jira_key,
+            "today":    today,
+        })
+        log.info("SharePoint updated for %s: %s rows marked Rotated", jira_key, result.get("updated", 0))
+    except Exception as e:
+        log.exception("Failed to update SharePoint for %s: %s", jira_key, e)
+
+
+@app.post("/jira-webhook")
+async def jira_webhook(request: Request):
+    """
+    Receives Jira automation webhooks when a ticket is resolved/closed.
+    Directly updates SharePoint — NO AI/LangChain — fast and reliable.
+
+    Jira Automation setup:
+      Trigger  : Work item transitioned → To: Resolved (or Done/Closed)
+      Action   : Send web request → POST https://<fqdn>/jira-webhook
+      Body     : {"issue": {"key": "{{issue.key}}", "fields": {"status": {"name": "{{issue.status.name}}"}}}}
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    issue  = payload.get("issue", {})
+    key    = issue.get("key") or payload.get("issueKey", "Unknown")
+    status = (issue.get("fields", {}).get("status", {}).get("name") or
+              payload.get("transition", {}).get("to", {}).get("name", "")).lower()
+
+    log.info("Jira webhook received: %s → '%s'", key, status)
+
+    closed_statuses = {"done", "closed", "resolved"}
+    if status in closed_statuses:
+        log.info("Ticket %s closed — updating SharePoint directly (no AI)", key)
+        asyncio.create_task(_update_sharepoint_on_close(key))
+        return {
+            "status":  "accepted",
+            "issue":   key,
+            "action":  "sharepoint_update_triggered",
+            "message": f"SharePoint update started for {key} — no AI needed"
+        }
+
+    log.info("Ticket %s transitioned to '%s' — no action needed", key, status)
+    return {
+        "status":  "received",
+        "issue":   key,
+        "action":  "none",
+        "message": f"Transition to '{status}' does not trigger SharePoint update"
+    }
