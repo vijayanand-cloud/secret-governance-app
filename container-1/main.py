@@ -2,10 +2,11 @@
 Azure Secret Governance — LangChain Agent  (Container 1)
 =========================================================
 Endpoints:
-  GET  /health        — liveness probe
-  POST /run           — trigger a governance cycle (background task — returns immediately)
-  POST /chat          — conversational endpoint with per-session memory
-  POST /jira-webhook  — Jira automation trigger when ticket is resolved
+  GET  /health          — liveness probe
+  POST /run             — trigger a governance cycle (background task — returns immediately)
+  POST /chat            — conversational endpoint with per-session memory
+  POST /jira-webhook    — Jira automation trigger when ticket is resolved
+  POST /teams-webhook   — Microsoft Teams Bot Service messages
 """
 
 from __future__ import annotations
@@ -56,6 +57,7 @@ AOAI_ENDPOINT   = _kv_get("AZURE-OPENAI-ENDPOINT")
 AOAI_API_KEY    = _kv_get("AZURE-OPENAI-API-KEY")
 AOAI_DEPLOYMENT = _kv_get("AZURE-OPENAI-DEPLOYMENT-NAME")
 log.info("Azure OpenAI config loaded. Deployment: %s", AOAI_DEPLOYMENT)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HTTP CLIENT — talks to Container 2 REST API
@@ -256,6 +258,18 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Azure Secret Governance Agent", lifespan=lifespan)
 
+# ── Teams Bot — comment out both lines below to disable ──────────────────────
+from teams_bot import router as teams_router
+import teams_bot
+teams_bot.configure(
+    bot_app_id     = _kv_get("BOT-APP-ID"),
+    bot_app_secret = _kv_get("BOT-APP-SECRET"),
+    bot_tenant_id  = _kv_get("BOT-TENANT-ID"),
+    get_agent_fn   = _get_agent,
+)
+app.include_router(teams_router)
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ── Request models ────────────────────────────────────────────────────────────
 
 class RunRequest(BaseModel):
@@ -361,3 +375,4 @@ async def jira_webhook(request: Request):
         "action":  "none",
         "message": f"Transition to '{status}' does not trigger SharePoint update"
     }
+
