@@ -203,10 +203,22 @@ async def run_secret_monitoring(
         return summary
 
     # ── Build SharePoint index ────────────────────────────────────────────────
+    # Filter by owner_email here — only process rows where AppOwners contains
+    # the OWNER-EMAIL from Key Vault. This is the primary ownership gate.
+    # Rows with blank AppOwners are skipped until an admin fills them in SP.
     sp_index: dict[tuple[str, str], dict] = {}
+    skipped_not_owned = 0
     for item in sp_data.get("items", []):
-        f = item.get("fields", {})
+        f          = item.get("fields", {})
+        app_owners = (f.get("AppOwners") or "").lower()
+        if owner_email and owner_email.lower() not in app_owners:
+            skipped_not_owned += 1
+            continue
         sp_index[(f.get("Title"), f.get("SecretID"))] = item
+
+    summary["skippedNotOwned"] = skipped_not_owned
+    if skipped_not_owned:
+        print(f"[INFO] Skipped {skipped_not_owned} rows not owned by {owner_email}")
 
     # ── Build candidates ──────────────────────────────────────────────────────
     candidates, build_errors = _build_candidates(azure_data.get("applications", []), now)
@@ -217,6 +229,8 @@ async def run_secret_monitoring(
         summary["totalsByBucket"][c["bucket"]] += 1
 
     # ── Split into new vs existing ────────────────────────────────────────────
+    # new_secrets: in Entra but NOT in sp_index (either genuinely new, or not owned)
+    # existing_secrets: in Entra AND in sp_index (owned + already tracked)
     new_secrets      = []
     existing_secrets = []
 
