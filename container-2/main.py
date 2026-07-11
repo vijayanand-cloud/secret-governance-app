@@ -30,6 +30,7 @@ def _kv_get(n: str) -> str:
 
 GRAPH_TENANT_ID    = _kv_get("GRAPH-TENANT-ID")
 GRAPH_TENANT_NAME  = _kv_get("GRAPH-TENANT-NAME")  # from KV — no Directory.Read.All needed
+OWNER_EMAIL        = _kv_get("OWNER-EMAIL")          # filter — only process apps owned by this
 JIRA_BASE_URL      = _kv_get("JIRA-BASE-URL")
 JIRA_API_TOKEN      = _kv_get("JIRA-API-TOKEN")
 JIRA_USER_EMAIL     = _kv_get("JIRA-USER-EMAIL")
@@ -72,7 +73,8 @@ def _jira_auth() -> str:
 # ── Tool Implementations ──────────────────────────────────────────────────────
 async def fetch_azure_secrets() -> dict:
     headers = {"Authorization": f"Bearer {await _graph_token()}"}
-    url = "https://graph.microsoft.com/v1.0/applications?$select=displayName,appId,passwordCredentials"
+    # Include 'id' (object ID) so we can fetch owners per app
+    url = "https://graph.microsoft.com/v1.0/applications?$select=id,displayName,appId,passwordCredentials"
     apps = []
     async with httpx.AsyncClient() as c:
         while url:
@@ -82,6 +84,44 @@ async def fetch_azure_secrets() -> dict:
             apps.extend(b.get("value", []))
             url = b.get("@odata.nextLink")
     return {"applications": apps, "count": len(apps)}
+
+async def fetch_app_owners(app_id: str) -> str:
+    """
+    Fetches owners of an App Registration from Entra ID.
+    Returns a comma-separated string of owner emails/names.
+
+    Owner types:
+      - User          → stored as UPN (email): vijay@contoso.com
+      - Service Principal → stored as displayName: automation-pipeline
+      - No owners     → returns empty string (admin fills manually in SharePoint)
+    """
+    headers = {"Authorization": f"Bearer {await _graph_token()}"}
+    url = f"https://graph.microsoft.com/v1.0/applications/{app_id}/owners"
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(url, headers=headers, timeout=15)
+            if not r.is_success:
+                return ""
+            owners = r.json().get("value", [])
+
+        owner_list = []
+        for owner in owners:
+            odata_type = owner.get("@odata.type", "")
+            if "user" in odata_type.lower():
+                # User owner — use their email (UPN)
+                upn = owner.get("userPrincipalName") or owner.get("mail") or owner.get("displayName", "")
+                if upn:
+                    owner_list.append(upn)
+            elif "servicePrincipal" in odata_type:
+                # Service Principal owner — use display name
+                name = owner.get("displayName", "")
+                if name:
+                    owner_list.append(name)
+
+        return ", ".join(owner_list)
+    except Exception as e:
+        log.warning("fetch_app_owners failed for %s: %s", app_id, e)
+        return ""
 
 async def get_sharepoint_state() -> dict:
     headers = {"Authorization": f"Bearer {await _graph_token()}"}
@@ -199,7 +239,16 @@ async def api_send_teams_alert(req: TeamsReq): return await send_teams_alert(req
 
 @app.post("/tools/run_secret_monitoring")
 async def api_run_monitoring():
-    return await _run_secret_monitoring(fetch_azure_secrets, get_sharepoint_state, write_sharepoint_row, create_jira_ticket, get_jira_issue, add_jira_comment, send_teams_alert)
+    return await _run_secret_monitoring(
+        fetch_azure_secrets  = fetch_azure_secrets,
+        get_sharepoint_state = get_sharepoint_state,
+        write_sharepoint_row = write_sharepoint_row,
+        create_jira_ticket   = create_jira_ticket,
+        get_jira_issue       = get_jira_issue,
+        add_jira_comment     = add_jira_comment,
+        send_teams_alert     = send_teams_alert,
+        owner_email          = OWNER_EMAIL,   # filter — discovery already stamped AppOwners
+    )
 
 class JiraCloseReq(BaseModel):
     jira_key: str

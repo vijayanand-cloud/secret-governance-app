@@ -161,13 +161,16 @@ async def _run_batched(tasks: list, batch_size: int, pause: float = BATCH_PAUSE)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def run_secret_monitoring(
-    fetch_azure_secrets:  Callable[[], Awaitable[dict]],
-    get_sharepoint_state: Callable[[], Awaitable[dict]],
-    write_sharepoint_row: Callable[..., Awaitable[dict]],
-    create_jira_ticket:   Callable[..., Awaitable[dict]],
-    get_jira_issue:       Callable[[str], Awaitable[dict]],
-    add_jira_comment:     Callable[[str, str], Awaitable[dict]],
-    send_teams_alert:     Callable[[str], Awaitable[dict]],
+    fetch_azure_secrets:    Callable[[], Awaitable[dict]],
+    get_sharepoint_state:   Callable[[], Awaitable[dict]],
+    write_sharepoint_row:   Callable[..., Awaitable[dict]],
+    create_jira_ticket:     Callable[..., Awaitable[dict]],
+    get_jira_issue:         Callable[[str], Awaitable[dict]],
+    add_jira_comment:       Callable[[str, str], Awaitable[dict]],
+    send_teams_alert:       Callable[[str], Awaitable[dict]],
+    owner_email:            str = "",                                   # filter by this owner
+    fetch_app_owners:       Callable[[str], Awaitable[str]] | None = None,  # legacy — not used
+    get_owned_app_ids:      Callable[[], Awaitable[set]] | None = None,     # legacy — not used
 ) -> dict:
     now   = datetime.now(timezone.utc)
     today = now.strftime("%Y-%m-%d")
@@ -175,11 +178,12 @@ async def run_secret_monitoring(
     summary: dict[str, Any] = {
         "runDate": today,
         "secretsScanned": 0,
-        "totalsByBucket": {b: 0 for b in ["B0", "P1", "P2", "P3", "ExpiredManualReview", "Ignore"]},
-        "b0LoggedOnly":      0,   # B0 secrets detected but NOT written to SharePoint
-        "newJiraTickets":    0,
-        "newTeamsAlerts":    0,
-        "jiraComments":      0,
+        "totalsByBucket":  {b: 0 for b in ["B0", "P1", "P2", "P3", "ExpiredManualReview", "Ignore"]},
+        "b0LoggedOnly":    0,   # B0 secrets — logged only, no SharePoint entry
+        "skippedNotOwned": 0,   # secrets skipped — app not owned by owner_email
+        "newJiraTickets":  0,
+        "newTeamsAlerts":  0,
+        "jiraComments":    0,
         "sharepointCreated": 0,
         "sharepointUpdated": 0,
         "errors": [],
@@ -278,6 +282,7 @@ async def run_secret_monitoring(
             "LastChecked":        today,
             "ExpiryBucket":       bucket,
             "AlertHistory":       f"[{today}] Alert generated at severity {bucket}.",
+            "AppOwners":          c.get("app_owners", ""),  # owners fetched from Entra ID
         }
         if jira_key:
             fields["JiraTicketCreatedDate"] = today
