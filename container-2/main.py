@@ -30,7 +30,20 @@ def _kv_get(n: str) -> str:
 
 GRAPH_TENANT_ID    = _kv_get("GRAPH-TENANT-ID")
 GRAPH_TENANT_NAME  = _kv_get("GRAPH-TENANT-NAME")  # from KV — no Directory.Read.All needed
-OWNER_EMAIL        = _kv_get("OWNER-EMAIL")          # filter — only process apps owned by this
+# OWNER-EMAILS supports multiple owners — comma-separated in KV
+# e.g. "vijayanand@x.com, john@x.com, priya@x.com"
+# Falls back to empty list if secret not set (processes all rows)
+try:
+    _owner_emails_raw = _kv_get("OWNER-EMAILS").strip()
+except Exception:
+    try:
+        # backwards compat — read old OWNER-EMAIL single-value secret
+        _owner_emails_raw = _kv_get("OWNER-EMAIL").strip()
+    except Exception:
+        _owner_emails_raw = ""
+
+OWNER_EMAILS = [e.strip() for e in _owner_emails_raw.split(",") if e.strip()]
+log.info("Owner filter: %s", OWNER_EMAILS)
 JIRA_BASE_URL      = _kv_get("JIRA-BASE-URL")
 JIRA_API_TOKEN      = _kv_get("JIRA-API-TOKEN")
 JIRA_USER_EMAIL     = _kv_get("JIRA-USER-EMAIL")
@@ -247,7 +260,7 @@ async def api_run_monitoring():
         get_jira_issue       = get_jira_issue,
         add_jira_comment     = add_jira_comment,
         send_teams_alert     = send_teams_alert,
-        owner_email          = OWNER_EMAIL,   # filter — discovery already stamped AppOwners
+        owner_emails         = OWNER_EMAILS,  # multi-owner list from KV OWNER-EMAILS secret
     )
 
 class JiraCloseReq(BaseModel):

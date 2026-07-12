@@ -7,6 +7,9 @@ Changes in this version:
   - Batch concurrent Jira ticket creation (5 in parallel)
   - Sequential Teams alerts (one per run, no batching needed)
   - Zero changes needed as list grows — fully self-adapting
+  - OWNER-EMAIL → OWNER-EMAILS (comma-separated) for multi-owner support
+    owner_email param renamed to owner_emails (list[str]) — KV value parsed
+    at call site in main.py; any-of-list match against AppOwners column.
 """
 
 from __future__ import annotations
@@ -168,7 +171,8 @@ async def run_secret_monitoring(
     get_jira_issue:         Callable[[str], Awaitable[dict]],
     add_jira_comment:       Callable[[str, str], Awaitable[dict]],
     send_teams_alert:       Callable[[str], Awaitable[dict]],
-    owner_email:            str = "",                                   # filter by this owner
+    owner_emails:           list[str] | None = None,   # filter — process rows owned by any of these
+    owner_email:            str = "",                  # legacy single-email param — still supported
     fetch_app_owners:       Callable[[str], Awaitable[str]] | None = None,  # legacy — not used
     get_owned_app_ids:      Callable[[], Awaitable[set]] | None = None,     # legacy — not used
 ) -> dict:
@@ -203,22 +207,33 @@ async def run_secret_monitoring(
         return summary
 
     # ── Build SharePoint index ────────────────────────────────────────────────
-    # Filter by owner_email here — only process rows where AppOwners contains
-    # the OWNER-EMAIL from Key Vault. This is the primary ownership gate.
+    # Resolve effective owner list — supports both single (legacy) and multi-owner.
+    # owner_emails takes priority; falls back to owner_email for backwards compat.
     # Rows with blank AppOwners are skipped until an admin fills them in SP.
+    if owner_emails:
+        effective_owners = [e.strip().lower() for e in owner_emails if e.strip()]
+    elif owner_email:
+        effective_owners = [owner_email.strip().lower()]
+    else:
+        effective_owners = []   # no filter — process all rows
+
     sp_index: dict[tuple[str, str], dict] = {}
     skipped_not_owned = 0
     for item in sp_data.get("items", []):
         f          = item.get("fields", {})
         app_owners = (f.get("AppOwners") or "").lower()
-        if owner_email and owner_email.lower() not in app_owners:
-            skipped_not_owned += 1
-            continue
+
+        if effective_owners:
+            # Row passes if ANY of the owner emails appears in AppOwners
+            if not any(email in app_owners for email in effective_owners):
+                skipped_not_owned += 1
+                continue
+
         sp_index[(f.get("Title"), f.get("SecretID"))] = item
 
     summary["skippedNotOwned"] = skipped_not_owned
     if skipped_not_owned:
-        print(f"[INFO] Skipped {skipped_not_owned} rows not owned by {owner_email}")
+        print(f"[INFO] Skipped {skipped_not_owned} rows — not owned by any of: {effective_owners}")
 
     # ── Build candidates ──────────────────────────────────────────────────────
     candidates, build_errors = _build_candidates(azure_data.get("applications", []), now)
