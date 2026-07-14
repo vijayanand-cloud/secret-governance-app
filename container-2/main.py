@@ -292,4 +292,99 @@ async def api_update_on_jira_close(req: JiraCloseReq):
     log.info("update_on_jira_close: %s rows updated for %s", updated, req.jira_key)
     return {"updated": updated, "jira_key": req.jira_key}
 
+class JiraStatusUpdateReq(BaseModel):
+    jira_key:  str
+    to_status: str   # Jira destination status: "Resolved", "In Progress", "To Do", etc.
+    today:     str
+
+@app.post("/tools/jira-status-update")
+async def api_jira_status_update(req: JiraStatusUpdateReq):
+    """
+    Unified endpoint — handles ALL Jira ticket transitions in one rule.
+    Called by a single Jira automation rule covering close + reopen.
+
+    Jira automation rule setup:
+      Trigger : Work item transitioned
+        To status : RESOLVED, IN PROGRESS, TO DO  (all three in one rule)
+      Action  : Send web request
+        Method : POST
+        URL    : https://<fqdn>/tools/jira-status-update
+        Body   : {
+                   "jira_key":  "{{issue.key}}",
+                   "to_status": "{{destinationStatus.name}}",
+                   "today":     "{{now.format('yyyy-MM-dd')}}"
+                 }
+
+    SharePoint updates:
+      Resolved              → AlertStatus = Rotated
+      In Progress / To Do   → AlertStatus = JiraRaised (reopen)
+      Anything else         → logged but no SP update
+    """
+    sp_data   = await get_sharepoint_state()
+    today     = req.today
+    updated   = 0
+    status    = req.to_status.strip().lower()
+
+    # Determine what AlertStatus to set based on Jira transition
+    CLOSE_STATUSES  = {"resolved", "done", "closed"}
+    REOPEN_STATUSES = {"in progress", "to do", "reopened", "open"}
+
+    if status in CLOSE_STATUSES:
+        new_alert_status = "Rotated"
+        new_expiry_notice = "Rotated — Completed"
+        extra_fields = {"RotationDetectedDate": today}
+    elif status in REOPEN_STATUSES:
+        new_alert_status  = "JiraRaised"
+        new_expiry_notice = f"Jira ticket {req.jira_key} reopened — monitoring resumed"
+        extra_fields      = {}
+    else:
+        log.info("jira-status-update: unhandled status '%s' for %s — no SP update",
+                 req.to_status, req.jira_key)
+        return {"updated": 0, "jira_key": req.jira_key,
+                "note": f"Status '{req.to_status}' not mapped — no action taken"}
+
+    # Find and update matching SP rows
+    for item in sp_data.get("items", []):
+        f = item.get("fields", {})
+        if f.get("JiraTicketKey") == req.jira_key:
+            fields = {
+                "AlertStatus":  new_alert_status,
+                "ExpiryNotice": new_expiry_notice,
+                "LastChecked":  today,
+                **extra_fields,
+            }
+            await write_sharepoint_row(item["id"], fields)
+            updated += 1
+            log.info("jira-status-update: item=%s jira=%s → AlertStatus=%s",
+                     item["id"], req.jira_key, new_alert_status)
+
+    log.info("jira-status-update: %s rows updated for %s (→ %s)",
+             updated, req.jira_key, new_alert_status)
+    return {
+        "updated":      updated,
+        "jira_key":     req.jira_key,
+        "to_status":    req.to_status,
+        "alert_status": new_alert_status,
+    }
+
+# Keep old endpoints for backwards compatibility
+class JiraCloseReqLegacy(BaseModel):
+    jira_key: str
+    today: str
+
+class JiraReopenReq(BaseModel):
+    jira_key: str
+    today: str
+
+@app.post("/tools/update_on_jira_reopen")
+async def api_update_on_jira_reopen(req: JiraReopenReq):
+    """Legacy endpoint — use /tools/jira-status-update instead."""
+    return await api_jira_status_update(
+        JiraStatusUpdateReq(
+            jira_key=req.jira_key,
+            to_status="In Progress",
+            today=req.today,
+        )
+    )
+
 log.info("REST API Server ready — GET /health | POST /tools/*")
