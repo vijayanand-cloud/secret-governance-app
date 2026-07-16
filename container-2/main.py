@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
-from azure.identity import ManagedIdentityCredential
+from azure.identity import ManagedIdentityCredential, ClientAssertionCredential
 from azure.keyvault.secrets import SecretClient
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -67,12 +67,25 @@ except Exception:
 log.info(f"Config loaded. Project: {JIRA_PROJECT_KEY} | Epic: {JIRA_EPIC_KEY}")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-# UAMI handles Graph auth — no client secret needed
-from azure.identity import ManagedIdentityCredential as _MIC
-_graph_credential = _MIC(client_id=UAMI_CLIENT_ID)
+# Federated credential — UAMI asserts identity → App Registration → Graph token
+CROSS_TENANT_APP_ID    = _kv_get("CROSS-TENANT-APP-ID")
+CROSS_TENANT_TENANT_ID = _kv_get("CROSS-TENANT-TENANT-ID")
+
+_uami_credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
+
+def _get_uami_assertion() -> str:
+    """Returns a short-lived UAMI token used as assertion for federated auth."""
+    token = _uami_credential.get_token("api://AzureADTokenExchange")
+    return token.token
+
+_graph_credential = ClientAssertionCredential(
+    tenant_id = CROSS_TENANT_TENANT_ID,
+    client_id = CROSS_TENANT_APP_ID,
+    func      = _get_uami_assertion,
+)
 
 async def _graph_token() -> str:
-    """Get Graph API token using UAMI — no client secret required."""
+    """Get Graph API token via federated credential (UAMI → App Registration)."""
     token = _graph_credential.get_token("https://graph.microsoft.com/.default")
     return token.token
 
