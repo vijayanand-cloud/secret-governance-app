@@ -31,7 +31,7 @@ BATCH_PAUSE       = 0.5  # seconds between batches — avoids throttling
 # ─────────────────────────────────────────────────────────────────────────────
 
 def classify_bucket(days: int) -> str:
-    if days >= 61:       return "P4"
+    if days >= 61:       return "B0"
     if 31 <= days <= 60: return "P3"
     if 8  <= days <= 30: return "P2"
     if 0  <= days <= 7:  return "P1"
@@ -182,8 +182,8 @@ async def run_secret_monitoring(
     summary: dict[str, Any] = {
         "runDate": today,
         "secretsScanned": 0,
-        "totalsByBucket":  {b: 0 for b in ["P4", "P1", "P2", "P3", "ExpiredManualReview", "Ignore"]},
-        "p4LoggedOnly":    0,   # B0 secrets — logged only, no SharePoint entry
+        "totalsByBucket":  {b: 0 for b in ["B0", "P1", "P2", "P3", "ExpiredManualReview", "Ignore"]},
+        "b0LoggedOnly":    0,   # B0 secrets — logged only, no SharePoint entry
         "skippedNotOwned": 0,   # secrets skipped — app not owned by owner_email
         "newJiraTickets":  0,
         "newTeamsAlerts":  0,
@@ -284,11 +284,11 @@ async def run_secret_monitoring(
 
     actionable_new = [
         c for c in new_secrets
-        if c["bucket"] not in ("P4", "Ignore") and _is_owned_new(c)
+        if c["bucket"] not in ("B0", "Ignore") and _is_owned_new(c)
     ]
     skipped_new_not_owned = len([
         c for c in new_secrets
-        if c["bucket"] not in ("P4", "Ignore") and not _is_owned_new(c)
+        if c["bucket"] not in ("B0", "Ignore") and not _is_owned_new(c)
     ])
     if skipped_new_not_owned:
         summary["skippedNotOwned"] += skipped_new_not_owned
@@ -388,9 +388,9 @@ async def run_secret_monitoring(
                 summary["newTeamsAlerts"] += 1
 
     # ── PHASE 3: Handle B0 new secrets — log only, NO SharePoint entry ─────────
-    b0_new = [c for c in new_secrets if c["bucket"] == "P4"]
+    b0_new = [c for c in new_secrets if c["bucket"] == "B0"]
     if b0_new:
-        summary["p4LoggedOnly"] += len(b0_new)
+        summary["b0LoggedOnly"] += len(b0_new)
         print(f"[INFO] B0 secrets (61+ days safe): {len(b0_new)} found — logged only, no SharePoint entry")
         for c in b0_new[:5]:  # log first 5 for visibility
             print(f"  B0: {c['app_name']} ({c['app_id']}) — expires in {c['days']} days")
@@ -447,7 +447,7 @@ async def _handle_existing_secret(
             result["sp_updated"] = True
         return result
 
-    if bucket in ("P4", "Ignore"):
+    if bucket in ("B0", "Ignore"):
         return result
 
     # Self-heal missing Jira ticket
