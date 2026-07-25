@@ -43,7 +43,9 @@ except Exception:
         _owner_emails_raw = ""
 
 OWNER_EMAILS = [e.strip() for e in _owner_emails_raw.split(",") if e.strip()]
-log.info("Owner filter: %s", OWNER_EMAILS)
+log.info("Legacy OWNER_EMAILS loaded (currently IGNORED — decision_engine.py "
+         "defaults to manual_owners_only=True, filtering on ManualAppOwners "
+         "instead): %s", OWNER_EMAILS)
 
 # TEAMS-TAG-EMAIL — NEW. The person @mentioned on P1 (0-3 day) Teams alerts.
 # decision_engine.py has accepted a teams_tag_email parameter to
@@ -333,7 +335,7 @@ async def api_run_monitoring():
         get_jira_issue       = get_jira_issue,
         add_jira_comment     = add_jira_comment,
         send_teams_alert     = send_teams_alert,
-        owner_emails         = OWNER_EMAILS,       # multi-owner list from KV OWNER-EMAILS secret
+        owner_emails         = OWNER_EMAILS,       # IGNORED by default — see manual_owners_only in decision_engine.py
         teams_tag_email      = TEAMS_TAG_EMAIL,    # NEW — person @mentioned on P1 alerts, from KV TEAMS-TAG-EMAIL
     )
 
