@@ -229,9 +229,16 @@ def _build_candidates(applications: list[dict], now: datetime) -> tuple[list[dic
     candidates: list[dict] = []
     errors: list[str] = []
     for app in applications:
-        app_id   = app.get("appId")
-        app_name = app.get("displayName") or "Unknown"
-        creds    = app.get("passwordCredentials") or []
+        app_id      = app.get("appId")
+        app_name    = app.get("displayName") or "Unknown"
+        creds       = app.get("passwordCredentials") or []
+        # NEW — carries the tenant this app was actually fetched from
+        # (main.py's fetch_azure_secrets() now scans multiple tenants and
+        # tags each app with _sourceTenantId, matching runbook_discovery.py's
+        # own pattern). Falls back to "" if somehow absent, so a caller that
+        # doesn't set this doesn't crash — write_sharepoint_row's own
+        # fallback to GRAPH_TENANT_ID takes over in that case.
+        source_tenant_id = app.get("_sourceTenantId", "")
         for cred in creds:
             end_dt_str = cred.get("endDateTime")
             if not end_dt_str:
@@ -250,6 +257,7 @@ def _build_candidates(applications: list[dict], now: datetime) -> tuple[list[dic
                 "expiration":  end_dt_str,
                 "days":        days,
                 "bucket":      classify_bucket(days),
+                "tenant_id":   source_tenant_id,
             })
     return candidates, errors
 
@@ -506,6 +514,15 @@ async def run_secret_monitoring(
             "AlertHistory":       f"[{today}] Alert generated at severity {bucket}.",
             "AppOwners":          c.get("app_owners", ""),
         }
+        # NEW — stamp the ACTUAL tenant this app was scanned from, not just
+        # whatever write_sharepoint_row's own GRAPH_TENANT_ID fallback would
+        # use. Only set if _build_candidates actually carried a tenant_id
+        # through (see FIX #2 above) — an empty string here would overwrite
+        # write_sharepoint_row's fallback with nothing, so we only include
+        # these keys when there's a real value.
+        if c.get("tenant_id"):
+            fields["TenantID"]   = c["tenant_id"]
+            fields["TenantName"] = c["tenant_id"]
         if jira_key:
             fields["JiraTicketCreatedDate"] = today
 
