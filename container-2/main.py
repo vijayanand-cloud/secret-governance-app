@@ -87,7 +87,7 @@ log.info(f"Config loaded. Project: {JIRA_PROJECT_KEY} | Epic: {JIRA_EPIC_KEY}")
 # ── Helpers ───────────────────────────────────────────────────────────────────
 # Federated credential — UAMI asserts identity → App Registration → Graph token
 #
-# FIX (matches runbook_discovery.py's v7 fix — this file never got it until now):
+# FIX #1 (matches runbook_discovery.py's v7 fix — this file never got it until now):
 # Previously this file used ONE credential, scoped to CROSS_TENANT_TENANT_ID, for
 # EVERY Graph call — both scanning App Registrations AND reading/writing
 # SharePoint. That's fine only as long as CROSS_TENANT_TENANT_ID happens to be
@@ -98,12 +98,36 @@ log.info(f"Config loaded. Project: {JIRA_PROJECT_KEY} | Epic: {JIRA_EPIC_KEY}")
 # even have a SharePoint license, producing exactly the error this file was
 # hitting: {"code":"BadRequest","message":"Tenant does not have a SPO license."}
 #
-# Fix: TWO separate credentials. One for Entra scanning (follows
-# CROSS_TENANT_TENANT_ID — whichever tenant is being scanned for apps/owners).
-# One for SharePoint (ALWAYS scoped to HOME_TENANT_ID, regardless of what's
-# being scanned) — since SHAREPOINT_SITE_ID only ever lives in one place.
-CROSS_TENANT_APP_ID    = _kv_get("CROSS-TENANT-APP-ID")
-CROSS_TENANT_TENANT_ID = _kv_get("CROSS-TENANT-TENANT-ID")
+# FIX #2 (matches runbook_discovery.py's v8 fix — this file never got this one
+# either): CROSS-TENANT-TENANT-ID in Key Vault was actually set to BOTH tenant
+# IDs, comma-joined ("70afdd80-...,c721d616-...") — the same format
+# runbook_discovery.py's PLURAL CROSS-TENANT-TENANT-IDS secret uses. But this
+# file was reading it as a SINGULAR value and passing the whole malformed
+# comma-joined string directly to ClientAssertionCredential(tenant_id=...).
+# That credential doesn't validate tenant_id at construction time — it just
+# interpolates it into the token endpoint URL
+# (https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token), and Entra
+# happened to still resolve a request against a malformed multi-value path —
+# incidental tolerance, NOT documented or guaranteed behavior, and there was no
+# way to know which tenant it actually authenticated against without checking
+# the resulting data's TenantID field by hand.
+#
+# Fix: read CROSS-TENANT-TENANT-IDS (plural, comma-separated) with the same
+# fallback-to-singular pattern discovery uses, build ONE federated credential
+# PER TENANT (a ClientAssertionCredential is bound to a single tenant_id at
+# construction), and loop over all of them when scanning for apps/owners —
+# see fetch_azure_secrets_all_tenants() and fetch_app_owners() below.
+CROSS_TENANT_APP_ID = _kv_get("CROSS-TENANT-APP-ID")
+
+try:
+    _tenant_ids_raw = _kv_get("CROSS-TENANT-TENANT-IDS")
+except Exception:
+    _tenant_ids_raw = _kv_get("CROSS-TENANT-TENANT-ID")
+    log.info("CROSS-TENANT-TENANT-IDS not set — falling back to singular "
+             "CROSS-TENANT-TENANT-ID for backwards compatibility.")
+
+CROSS_TENANT_TENANT_IDS = [t.strip() for t in _tenant_ids_raw.split(",") if t.strip()]
+log.info("Configured to scan %d tenant(s): %s", len(CROSS_TENANT_TENANT_IDS), CROSS_TENANT_TENANT_IDS)
 
 # HOME_TENANT_ID — the tenant where SharePoint actually lives. Falls back to
 # GRAPH_TENANT_ID if not set, matching runbook_discovery.py's same pattern —
@@ -122,13 +146,18 @@ def _get_uami_assertion() -> str:
     token = _uami_credential.get_token("api://AzureADTokenExchange")
     return token.token
 
-# Credential for Entra scanning (fetch_azure_secrets, fetch_app_owners) —
-# follows CROSS_TENANT_TENANT_ID, whichever tenant is currently being scanned.
-_graph_credential = ClientAssertionCredential(
-    tenant_id = CROSS_TENANT_TENANT_ID,
-    client_id = CROSS_TENANT_APP_ID,
-    func      = _get_uami_assertion,
-)
+# One federated credential PER TENANT being scanned — a ClientAssertionCredential
+# is bound to a single tenant_id at construction, so multi-tenant support means
+# building one of these per tenant, not reusing a single instance. Matches
+# runbook_discovery.py's _graph_credentials_by_tenant exactly.
+_graph_credentials_by_tenant: dict[str, ClientAssertionCredential] = {
+    tenant_id: ClientAssertionCredential(
+        tenant_id = tenant_id,
+        client_id = CROSS_TENANT_APP_ID,
+        func      = _get_uami_assertion,
+    )
+    for tenant_id in CROSS_TENANT_TENANT_IDS
+}
 
 # Credential for SharePoint (get_sharepoint_state, write_sharepoint_row) —
 # ALWAYS scoped to HOME_TENANT_ID, independent of whichever tenant is
@@ -139,10 +168,11 @@ _sp_graph_credential = ClientAssertionCredential(
     func      = _get_uami_assertion,
 )
 
-async def _graph_token() -> str:
-    """Get Graph API token for ENTRA SCANNING via federated credential — use
+async def _graph_token_for_tenant(tenant_id: str) -> str:
+    """Get Graph API token for ENTRA SCANNING, for a SPECIFIC tenant. Use
     this for fetch_azure_secrets/fetch_app_owners ONLY, never for SharePoint."""
-    token = _graph_credential.get_token("https://graph.microsoft.com/.default")
+    credential = _graph_credentials_by_tenant[tenant_id]
+    token = credential.get_token("https://graph.microsoft.com/.default")
     return token.token
 
 async def _sp_graph_token() -> str:
@@ -160,30 +190,64 @@ def _jira_auth() -> str:
 
 # ── Tool Implementations ──────────────────────────────────────────────────────
 async def fetch_azure_secrets() -> dict:
-    headers = {"Authorization": f"Bearer {await _graph_token()}"}
-    # Include 'id' (object ID) so we can fetch owners per app
-    url = "https://graph.microsoft.com/v1.0/applications?$select=id,displayName,appId,passwordCredentials"
-    apps = []
-    async with httpx.AsyncClient() as c:
-        while url:
-            r = await c.get(url, headers=headers, timeout=30)
-            r.raise_for_status()
-            b = r.json()
-            apps.extend(b.get("value", []))
-            url = b.get("@odata.nextLink")
-    return {"applications": apps, "count": len(apps)}
-
-async def fetch_app_owners(app_id: str) -> str:
     """
-    Fetches owners of an App Registration from Entra ID.
-    Returns a comma-separated string of owner emails/names.
+    Fetches ALL App Registrations across ALL configured tenants
+    (CROSS_TENANT_TENANT_IDS), not just one — see the FIX #2 note above the
+    credential setup for why this was previously silently limited to a single
+    tenant despite Key Vault holding both tenant IDs.
+
+    Each app dict gets a '_sourceTenantId' key added, matching
+    runbook_discovery.py's fetch_all_applications_all_tenants() exactly —
+    fetch_app_owners() needs this to look up owners in the SAME tenant the
+    app actually lives in, not necessarily the first/home tenant.
+
+    A failure fetching ONE tenant is logged and that tenant contributes zero
+    apps, but other tenants still get scanned — same reliability reasoning
+    as discovery: a temporary issue with one tenant (revoked consent,
+    expired trust) shouldn't block monitoring for every other tenant.
+    """
+    all_apps: list[dict] = []
+    tenant_errors: list[str] = []
+
+    for tenant_id in CROSS_TENANT_TENANT_IDS:
+        try:
+            headers = {"Authorization": f"Bearer {await _graph_token_for_tenant(tenant_id)}"}
+            url = "https://graph.microsoft.com/v1.0/applications?$select=id,displayName,appId,passwordCredentials"
+            tenant_apps = []
+            async with httpx.AsyncClient() as c:
+                while url:
+                    r = await c.get(url, headers=headers, timeout=30)
+                    r.raise_for_status()
+                    b = r.json()
+                    tenant_apps.extend(b.get("value", []))
+                    url = b.get("@odata.nextLink")
+            for app in tenant_apps:
+                app["_sourceTenantId"] = tenant_id
+            all_apps.extend(tenant_apps)
+            log.info("Fetched %d App Registrations from tenant %s", len(tenant_apps), tenant_id)
+        except Exception as e:
+            tenant_errors.append(f"Tenant {tenant_id}: fetch_azure_secrets failed: {e}")
+            log.error("Failed to fetch applications from tenant %s: %s", tenant_id, e)
+
+    if tenant_errors:
+        log.warning("fetch_azure_secrets completed with %d tenant error(s): %s",
+                    len(tenant_errors), tenant_errors)
+
+    return {"applications": all_apps, "count": len(all_apps), "tenantErrors": tenant_errors}
+
+async def fetch_app_owners(app_id: str, tenant_id: str) -> str:
+    """
+    Fetches owners of an App Registration from Entra ID, scoped to the
+    SPECIFIC tenant this app lives in — tenant_id is now REQUIRED (was
+    previously implicit/always-the-one-configured-tenant before multi-tenant
+    support). Returns a comma-separated string of owner emails/names.
 
     Owner types:
       - User          → stored as UPN (email): vijay@contoso.com
       - Service Principal → stored as displayName: automation-pipeline
       - No owners     → returns empty string (admin fills manually in SharePoint)
     """
-    headers = {"Authorization": f"Bearer {await _graph_token()}"}
+    headers = {"Authorization": f"Bearer {await _graph_token_for_tenant(tenant_id)}"}
     url = f"https://graph.microsoft.com/v1.0/applications/{app_id}/owners"
     try:
         async with httpx.AsyncClient() as c:
@@ -237,8 +301,16 @@ async def get_sharepoint_state() -> dict:
 async def write_sharepoint_row(item_id: str | None, fields: dict[str, str]) -> dict:
     for col in {"LastChecked", "AlertSentDate", "RotationDetectedDate", "ExpirationDate", "JiraTicketCreatedDate"}:
         if col in fields and fields[col]: fields[col] = str(fields[col])[:10]
-    fields["TenantID"] = GRAPH_TENANT_ID
-    fields["TenantName"] = await get_tenant_name()
+    # CHANGED: only default TenantID/TenantName to the home tenant if the
+    # caller hasn't already set them. decision_engine.py now stamps the
+    # ACTUAL tenant a given app was scanned from (see _build_candidates'
+    # tenant_id field) — unconditionally overwriting here would silently
+    # discard that and mislabel every row as the home tenant, defeating the
+    # whole point of multi-tenant scanning.
+    if not fields.get("TenantID"):
+        fields["TenantID"] = GRAPH_TENANT_ID
+    if not fields.get("TenantName"):
+        fields["TenantName"] = await get_tenant_name()
     headers = {"Authorization": f"Bearer {await _sp_graph_token()}", "Content-Type": "application/json"}
     base = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{SHAREPOINT_LIST_ID}/items"
     async with httpx.AsyncClient() as c:
