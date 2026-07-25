@@ -86,8 +86,34 @@ log.info(f"Config loaded. Project: {JIRA_PROJECT_KEY} | Epic: {JIRA_EPIC_KEY}")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 # Federated credential — UAMI asserts identity → App Registration → Graph token
+#
+# FIX (matches runbook_discovery.py's v7 fix — this file never got it until now):
+# Previously this file used ONE credential, scoped to CROSS_TENANT_TENANT_ID, for
+# EVERY Graph call — both scanning App Registrations AND reading/writing
+# SharePoint. That's fine only as long as CROSS_TENANT_TENANT_ID happens to be
+# the same tenant SharePoint lives in. The moment CROSS_TENANT_TENANT_ID is
+# pointed at a genuinely different tenant (to scan THAT tenant's App
+# Registrations, as this project's multi-tenant discovery setup does), every
+# SharePoint call in this file also got scoped to that tenant — which may not
+# even have a SharePoint license, producing exactly the error this file was
+# hitting: {"code":"BadRequest","message":"Tenant does not have a SPO license."}
+#
+# Fix: TWO separate credentials. One for Entra scanning (follows
+# CROSS_TENANT_TENANT_ID — whichever tenant is being scanned for apps/owners).
+# One for SharePoint (ALWAYS scoped to HOME_TENANT_ID, regardless of what's
+# being scanned) — since SHAREPOINT_SITE_ID only ever lives in one place.
 CROSS_TENANT_APP_ID    = _kv_get("CROSS-TENANT-APP-ID")
 CROSS_TENANT_TENANT_ID = _kv_get("CROSS-TENANT-TENANT-ID")
+
+# HOME_TENANT_ID — the tenant where SharePoint actually lives. Falls back to
+# GRAPH_TENANT_ID if not set, matching runbook_discovery.py's same pattern —
+# GRAPH_TENANT_ID has always been treated as the home/primary tenant.
+try:
+    HOME_TENANT_ID = _kv_get("HOME-TENANT-ID")
+except Exception:
+    HOME_TENANT_ID = GRAPH_TENANT_ID
+    log.info("HOME-TENANT-ID not set — falling back to GRAPH-TENANT-ID (%s) "
+             "as the home tenant for SharePoint operations.", GRAPH_TENANT_ID)
 
 _uami_credential = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
 
@@ -96,15 +122,33 @@ def _get_uami_assertion() -> str:
     token = _uami_credential.get_token("api://AzureADTokenExchange")
     return token.token
 
+# Credential for Entra scanning (fetch_azure_secrets, fetch_app_owners) —
+# follows CROSS_TENANT_TENANT_ID, whichever tenant is currently being scanned.
 _graph_credential = ClientAssertionCredential(
     tenant_id = CROSS_TENANT_TENANT_ID,
     client_id = CROSS_TENANT_APP_ID,
     func      = _get_uami_assertion,
 )
 
+# Credential for SharePoint (get_sharepoint_state, write_sharepoint_row) —
+# ALWAYS scoped to HOME_TENANT_ID, independent of whichever tenant is
+# currently being scanned for App Registrations.
+_sp_graph_credential = ClientAssertionCredential(
+    tenant_id = HOME_TENANT_ID,
+    client_id = CROSS_TENANT_APP_ID,
+    func      = _get_uami_assertion,
+)
+
 async def _graph_token() -> str:
-    """Get Graph API token via federated credential (UAMI → App Registration)."""
+    """Get Graph API token for ENTRA SCANNING via federated credential — use
+    this for fetch_azure_secrets/fetch_app_owners ONLY, never for SharePoint."""
     token = _graph_credential.get_token("https://graph.microsoft.com/.default")
+    return token.token
+
+async def _sp_graph_token() -> str:
+    """Get Graph API token for SHAREPOINT via federated credential — ALWAYS
+    home tenant. Use this for get_sharepoint_state/write_sharepoint_row."""
+    token = _sp_graph_credential.get_token("https://graph.microsoft.com/.default")
     return token.token
 
 async def get_tenant_name() -> str:
@@ -168,7 +212,7 @@ async def fetch_app_owners(app_id: str) -> str:
         return ""
 
 async def get_sharepoint_state() -> dict:
-    headers = {"Authorization": f"Bearer {await _graph_token()}"}
+    headers = {"Authorization": f"Bearer {await _sp_graph_token()}"}
     url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{SHAREPOINT_LIST_ID}/items?$expand=fields"
     items = []
     async with httpx.AsyncClient() as c:
@@ -195,7 +239,7 @@ async def write_sharepoint_row(item_id: str | None, fields: dict[str, str]) -> d
         if col in fields and fields[col]: fields[col] = str(fields[col])[:10]
     fields["TenantID"] = GRAPH_TENANT_ID
     fields["TenantName"] = await get_tenant_name()
-    headers = {"Authorization": f"Bearer {await _graph_token()}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {await _sp_graph_token()}", "Content-Type": "application/json"}
     base = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{SHAREPOINT_LIST_ID}/items"
     async with httpx.AsyncClient() as c:
         if item_id is None:
