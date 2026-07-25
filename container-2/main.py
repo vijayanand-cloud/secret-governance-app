@@ -44,6 +44,22 @@ except Exception:
 
 OWNER_EMAILS = [e.strip() for e in _owner_emails_raw.split(",") if e.strip()]
 log.info("Owner filter: %s", OWNER_EMAILS)
+
+# TEAMS-TAG-EMAIL — NEW. The person @mentioned on P1 (0-3 day) Teams alerts.
+# decision_engine.py has accepted a teams_tag_email parameter to
+# run_secret_monitoring() since the P1/P2 bucket split was introduced, but
+# nothing here was actually reading the KV secret or passing it through —
+# so P1 alerts were firing without a tag despite the mechanism existing.
+# This fixes that wiring. Falls back to empty string (no tag) if not set,
+# so a missing secret degrades gracefully rather than breaking the run.
+try:
+    TEAMS_TAG_EMAIL = _kv_get("TEAMS-TAG-EMAIL").strip()
+except Exception:
+    TEAMS_TAG_EMAIL = ""
+    log.warning("TEAMS-TAG-EMAIL not set in Key Vault — P1 alerts will NOT "
+                "tag anyone until this secret is configured.")
+log.info("Teams tag target for P1 alerts: %s", TEAMS_TAG_EMAIL or "(none configured)")
+
 JIRA_BASE_URL      = _kv_get("JIRA-BASE-URL")
 JIRA_API_TOKEN      = _kv_get("JIRA-API-TOKEN")
 JIRA_USER_EMAIL     = _kv_get("JIRA-USER-EMAIL")
@@ -206,8 +222,50 @@ async def add_jira_comment(issue_key: str, comment_text: str) -> dict:
         r.raise_for_status()
     return {"issue_key": issue_key, "comment_id": r.json().get("id", "")}
 
-async def send_teams_alert(alert_text: str) -> dict:
-    payload = {"attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": {"type": "AdaptiveCard", "$schema": "http://adaptivecards.io/schemas/adaptive-card.json", "version": "1.4", "body": [{"type": "TextBlock", "text": alert_text, "wrap": True}]}}]}
+def _build_teams_mention_payload(alert_text: str, tag_email: str | None) -> dict:
+    """
+    Mirrors decision_engine.py's own _build_teams_mention_payload — kept here
+    too since send_teams_alert is the actual HTTP boundary that posts to the
+    Teams webhook, and needs to build the same msteams mention entity shape.
+    If tag_email is empty/None, this degrades to a plain TextBlock with no
+    mention — the same behavior as before this change, for every bucket that
+    isn't P1.
+    """
+    body_items = [{"type": "TextBlock", "text": alert_text, "wrap": True}]
+    msteams_entities = []
+
+    if tag_email:
+        mention_text = f"<at>{tag_email}</at>"
+        body_items.append({"type": "TextBlock", "text": f"Attention: {mention_text}", "wrap": True})
+        msteams_entities.append({
+            "type": "mention",
+            "text": mention_text,
+            "mentioned": {"id": tag_email, "name": tag_email},
+        })
+
+    card_content: dict[str, Any] = {
+        "type": "AdaptiveCard",
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "version": "1.4",
+        "body": body_items,
+    }
+    if msteams_entities:
+        card_content["msteams"] = {"entities": msteams_entities}
+
+    return {"attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": card_content}]}
+
+async def send_teams_alert(alert_text: str, tag_email: str | None = None) -> dict:
+    """
+    UPDATED — now accepts tag_email, matching decision_engine.py's call
+    signature: send_teams_alert(text, tag_email=tag_email). Previously this
+    function ignored any tag entirely and always sent a plain TextBlock —
+    so even though decision_engine.py already computed tag_email for P1
+    alerts and passed it through, nothing here actually used it, and no
+    P1 alert ever tagged anyone. This was the missing half of the wiring;
+    the other half (reading TEAMS-TAG-EMAIL from Key Vault, passing it into
+    run_secret_monitoring) is done at the bottom of this file.
+    """
+    payload = _build_teams_mention_payload(alert_text, tag_email)
     async with httpx.AsyncClient() as c:
         try:
             r = await c.post(TEAMS_WEBHOOK_URL, content=json.dumps(payload), headers={"Content-Type": "application/json"}, timeout=20)
@@ -259,9 +317,11 @@ class CommentReq(BaseModel):
 @app.post("/tools/add_jira_comment")
 async def api_add_jira_comment(req: CommentReq): return await add_jira_comment(req.issue_key, req.comment_text)
 
-class TeamsReq(BaseModel): alert_text: str
+class TeamsReq(BaseModel):
+    alert_text: str
+    tag_email: Optional[str] = None
 @app.post("/tools/send_teams_alert")
-async def api_send_teams_alert(req: TeamsReq): return await send_teams_alert(req.alert_text)
+async def api_send_teams_alert(req: TeamsReq): return await send_teams_alert(req.alert_text, req.tag_email)
 
 @app.post("/tools/run_secret_monitoring")
 async def api_run_monitoring():
@@ -273,7 +333,8 @@ async def api_run_monitoring():
         get_jira_issue       = get_jira_issue,
         add_jira_comment     = add_jira_comment,
         send_teams_alert     = send_teams_alert,
-        owner_emails         = OWNER_EMAILS,  # multi-owner list from KV OWNER-EMAILS secret
+        owner_emails         = OWNER_EMAILS,       # multi-owner list from KV OWNER-EMAILS secret
+        teams_tag_email      = TEAMS_TAG_EMAIL,    # NEW — person @mentioned on P1 alerts, from KV TEAMS-TAG-EMAIL
     )
 
 class JiraCloseReq(BaseModel):
