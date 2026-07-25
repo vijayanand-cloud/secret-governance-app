@@ -174,6 +174,16 @@ async def get_sharepoint_state() -> dict:
     async with httpx.AsyncClient() as c:
         while url:
             r = await c.get(url, headers=headers, timeout=30)
+            if not r.is_success:
+                # LOG THE ACTUAL GRAPH ERROR BODY before raising — httpx's own
+                # request-logging middleware only prints method/URL/status
+                # ("400 Bad Request"), never the response body, and
+                # raise_for_status() discards it too. Graph's error body
+                # almost always names the specific problem (bad OData query,
+                # token/consent issue, malformed filter, etc.) — without this,
+                # every failure here looks identical regardless of cause.
+                log.error("get_sharepoint_state Graph error [%s] for %s: %s",
+                          r.status_code, url, r.text[:2000])
             r.raise_for_status()
             b = r.json()
             items.extend(b.get("value", []))
