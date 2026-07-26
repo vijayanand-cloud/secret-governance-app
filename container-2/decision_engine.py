@@ -46,6 +46,44 @@ Changes in this version:
     accepted as parameters for backwards compatibility but are IGNORED
     by default — set manual_owners_only=False at the call site in
     main.py to fall back to the old AppOwners/OWNER-EMAILS behavior.
+
+  - P5 NOW LANDS IN SecretAlertRegistry (matches runbook_discovery.py's
+    v10.2 one-time change): previously P5 rows never reached this file's
+    main loop at all, since discovery routed them to IgnoredSecretRegistry.
+    Now that discovery writes P5 into SecretAlertRegistry, _handle_existing_
+    secret's P5/Ignore branch was fixed — it previously returned immediately
+    with NO SharePoint write at all when it saw a P5/Ignore bucket, meaning
+    a P5 row's ExpiryBucket/ExpiryNotice/ExpirationDate never refreshed as
+    time passed, even once the secret had genuinely aged into P4. It now
+    still writes those three fields every run (keeping the bucket-transition
+    comparison on a LATER run accurate) while still correctly sending no
+    alert and creating no ticket for P5/Ignore.
+
+  - MANUALAPPOWNERS APP-WIDE PROPAGATION (NEW): app ownership is a property
+    of the App Registration, not of any one secret — every secret under the
+    same app belongs to the same app. If a human fills in ManualAppOwners
+    on just ONE secret's row, every OTHER row for that same app_id is now
+    automatically backfilled with the same value on the next monitoring
+    run, rather than staying blank until someone manually fills in every
+    row individually. Runs BEFORE the ownership filter so a sibling row
+    backfilled this run is treated as actionable in the SAME run.
+
+  - LITERAL P1/P2/P3/P4 JIRA PRIORITIES (NEW, explicit client requirement):
+    SEVERITY_MAP's priority field for P1-P4 is now the literal bucket name
+    ("P1"/"P2"/"P3"/"P4"), not Jira's default Highest/High/Medium/Low
+    scheme. REQUIRES priorities named exactly "P1"/"P2"/"P3"/"P4" to already
+    exist in the Jira project's priority scheme — if they don't, ticket
+    creation fails with a 400 from Jira's API. ExpiredManualReview is
+    unchanged (still "Highest") — it is not one of the four buckets this
+    requirement covers.
+
+  - BLOCKED / AWAITING REPORTER — PAUSED, NOT TERMINAL (NEW): matches the
+    two new statuses main.py's jira-status-update endpoint can now set
+    (see that file). A row in either state is skipped by monitoring's
+    normal escalation/alert logic (same treatment as the true terminal
+    statuses) but still gets ExpiryNotice/LastChecked refreshed each run so
+    it doesn't look abandoned, and resumes normal monitoring once the Jira
+    ticket moves to a different status.
 """
 
 from __future__ import annotations
@@ -87,7 +125,13 @@ def classify_bucket(days: int) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 TERMINAL_STATUSES    = {"Rotated", "Ignored", "Resolved"}
-MONITOR_SKIP_STATUSES = TERMINAL_STATUSES | {"RotatedPendingDeployment"}
+# NEW — PAUSED, not permanently terminal. A row here is expected to resume
+# normal monitoring once its Jira ticket moves to a different status (the
+# jira-status-update endpoint in main.py is what moves it OUT of this state
+# again, same mechanism that put it here). Distinct from TERMINAL_STATUSES:
+# terminal rows are done forever; paused rows are just quiet for now.
+PAUSED_STATUSES       = {"Blocked", "AwaitingReporter"}
+MONITOR_SKIP_STATUSES = TERMINAL_STATUSES | PAUSED_STATUSES | {"RotatedPendingDeployment"}
 CLOSED_NAMES         = {"done", "closed", "resolved"}
 
 # Stage numbers determine escalation direction — higher stage always wins
@@ -112,10 +156,19 @@ ALERT_STATUS_FOR_BUCKET = {
 }
 
 SEVERITY_MAP = {
-    "P4": {"severity": "INFORMATION", "priority": "Low"},
-    "P3": {"severity": "WARNING",     "priority": "Medium"},
-    "P2": {"severity": "CRITICAL",    "priority": "High"},
-    "P1": {"severity": "CRITICAL",    "priority": "Highest"},
+    # NEW: priority is now the LITERAL bucket name ("P1"/"P2"/"P3"/"P4"), not
+    # Jira's default Highest/High/Medium/Low scheme — explicit client
+    # requirement. This REQUIRES priorities named exactly "P1", "P2", "P3",
+    # "P4" to already exist in the Jira project's priority scheme (Jira
+    # Settings → Issues → Priorities, or the project's priority scheme) —
+    # if they don't exist yet, ticket creation will fail with a 400 from
+    # Jira's API rather than silently falling back to a default.
+    # ExpiredManualReview is NOT one of the four buckets covered by this
+    # requirement — it keeps Jira's standard "Highest" priority, unchanged.
+    "P4": {"severity": "INFORMATION", "priority": "P4"},
+    "P3": {"severity": "WARNING",     "priority": "P3"},
+    "P2": {"severity": "CRITICAL",    "priority": "P2"},
+    "P1": {"severity": "CRITICAL",    "priority": "P1"},
     "ExpiredManualReview": {"severity": "EXPIRED", "priority": "Highest"},
 }
 
@@ -288,6 +341,7 @@ async def run_secret_monitoring(
     get_jira_issue:         Callable[[str], Awaitable[dict]],
     add_jira_comment:       Callable[[str, str], Awaitable[dict]],
     send_teams_alert:       Callable[..., Awaitable[dict]],
+    move_secret_to_ignored: Callable[..., Awaitable[dict]] | None = None,  # NEW — -8-day abandoned-secret move
     owner_emails:           list[str] | None = None,   # DEPRECATED — see manual_owners_only below
     owner_email:            str = "",                  # DEPRECATED — see manual_owners_only below
     fetch_app_owners:       Callable[[str], Awaitable[str]] | None = None,  # legacy — not used
@@ -316,6 +370,8 @@ async def run_secret_monitoring(
         "jiraComments":    0,
         "sharepointCreated": 0,
         "sharepointUpdated": 0,
+        "manualOwnersPropagated": 0,   # NEW — sibling rows backfilled with an app-wide ManualAppOwners value
+        "movedToIgnored": 0,           # NEW — abandoned secrets (-8+ days, no ticket or Canceled) moved to IgnoredSecretRegistry
         "errors": [],
     }
 
@@ -332,6 +388,49 @@ async def run_secret_monitoring(
         summary["errors"].append(f"get_sharepoint_state failed: {e}")
         return summary
 
+    # ── NEW: propagate ManualAppOwners app-wide, BEFORE filtering ─────────────
+    # App ownership is a property of the APP REGISTRATION, not of any one
+    # secret — every secret under the same app belongs to the same app. If a
+    # human fills in ManualAppOwners on just ONE secret's row, every OTHER
+    # row for that same app_id should get the same value. This runs BEFORE
+    # the ownership filter below so a sibling row that gets backfilled THIS
+    # run is correctly treated as actionable in the SAME run, not left
+    # waiting for a second run to notice the propagated value.
+    app_manual_owners_original: dict[str, str] = {}
+    for item in sp_data.get("items", []):
+        f      = item.get("fields", {})
+        app_id = f.get("Title", "")
+        manual = (f.get("ManualAppOwners") or "").strip()
+        if app_id and manual and app_id not in app_manual_owners_original:
+            app_manual_owners_original[app_id] = manual
+
+    propagate_ops: list[tuple[str, dict]] = []   # (item_id, fields) pairs
+    for item in sp_data.get("items", []):
+        f       = item.get("fields", {})
+        app_id  = f.get("Title", "")
+        item_id = item.get("id")
+        current = (f.get("ManualAppOwners") or "").strip()
+        best    = app_manual_owners_original.get(app_id, "")
+        if best and not current:
+            propagate_ops.append((item_id, {"ManualAppOwners": best}))
+            # Update the IN-MEMORY copy too, so every check further down this
+            # same run (filtering, sp_app_owners, sp_index) sees the
+            # propagated value immediately rather than the stale blank one.
+            f["ManualAppOwners"] = best
+
+    if propagate_ops:
+        print(f"[INFO] Propagating ManualAppOwners to {len(propagate_ops)} sibling row(s) "
+              f"across {len(app_manual_owners_original)} app(s) with an owner set")
+        propagate_tasks = [write_sharepoint_row(iid, flds) for iid, flds in propagate_ops]
+        propagate_results = await _run_batched(propagate_tasks, SP_WRITE_BATCH)
+        propagate_ok = sum(1 for r in propagate_results if not isinstance(r, Exception))
+        summary["manualOwnersPropagated"] = propagate_ok
+        for r in propagate_results:
+            if isinstance(r, Exception):
+                summary["errors"].append(f"ManualAppOwners propagation failed: {r}")
+    else:
+        summary["manualOwnersPropagated"] = 0
+
     # ── Build SharePoint index ────────────────────────────────────────────────
     # FILTER CHANGE: monitoring now only processes rows where ManualAppOwners
     # is non-blank — this is a deliberate opt-in gate, not the old "does
@@ -340,7 +439,9 @@ async def run_secret_monitoring(
     # is the one column discovery itself never writes to), so a row only
     # becomes actionable once a human has explicitly marked that app for
     # monitoring/rotation. owner_emails/owner_email are ignored entirely when
-    # manual_owners_only is True (the default).
+    # manual_owners_only is True (the default). Thanks to the propagation
+    # step just above, a sibling row backfilled THIS run is already reflected
+    # in sp_data's in-memory fields by the time this filter runs.
     if manual_owners_only:
         effective_owners: list[str] = []   # unused in this mode, kept for the old branch below
     elif owner_emails:
@@ -579,7 +680,7 @@ async def run_secret_monitoring(
                 c, c["bucket"], existing, today, summary,
                 write_sharepoint_row, create_jira_ticket,
                 get_jira_issue, add_jira_comment, send_teams_alert,
-                teams_tag_email,
+                teams_tag_email, move_secret_to_ignored,
             )
             return result
         except Exception as e:
@@ -594,10 +695,11 @@ async def run_secret_monitoring(
         elif res and res.get("error"):
             summary["errors"].append(res["error"])
         elif res:
-            if res.get("sp_updated"):   summary["sharepointUpdated"] += 1
-            if res.get("jira_created"): summary["newJiraTickets"]    += 1
-            if res.get("jira_comment"): summary["jiraComments"]      += 1
-            if res.get("teams_sent"):   summary["newTeamsAlerts"]    += 1
+            if res.get("sp_updated"):     summary["sharepointUpdated"]      += 1
+            if res.get("jira_created"):   summary["newJiraTickets"]         += 1
+            if res.get("jira_comment"):   summary["jiraComments"]           += 1
+            if res.get("teams_sent"):     summary["newTeamsAlerts"]         += 1
+            if res.get("moved_to_ignored"): summary["movedToIgnored"]       += 1
 
     return summary
 
@@ -610,6 +712,7 @@ async def _handle_existing_secret(
     c: dict, bucket: str, existing: dict, today: str, summary: dict,
     write_sharepoint_row, create_jira_ticket, get_jira_issue,
     add_jira_comment, send_teams_alert, teams_tag_email: str = "",
+    move_secret_to_ignored=None,
 ) -> dict:
     f            = existing.get("fields", {})
     item_id      = existing.get("id")
@@ -617,15 +720,145 @@ async def _handle_existing_secret(
     jira_key     = f.get("JiraTicketKey", "")
     notice       = _expiry_notice(c["days"])
     result       = {"sp_updated": False, "jira_created": False,
-                    "jira_comment": False, "teams_sent": False, "error": None}
+                    "jira_comment": False, "teams_sent": False,
+                    "moved_to_ignored": False, "error": None}
 
     if alert_status in MONITOR_SKIP_STATUSES:
-        if alert_status == "RotatedPendingDeployment":
+        # RotatedPendingDeployment and the new PAUSED_STATUSES (Blocked,
+        # AwaitingReporter) still get their ExpiryNotice/LastChecked
+        # refreshed each run — so the row doesn't look abandoned/stale in
+        # SharePoint — but get NO alert, ticket, or escalation activity.
+        # True TERMINAL_STATUSES (Rotated/Ignored/Resolved) get nothing at
+        # all, since there's nothing left to keep current on a closed row.
+        if alert_status == "RotatedPendingDeployment" or alert_status in PAUSED_STATUSES:
             await write_sharepoint_row(item_id, {"ExpiryNotice": notice, "LastChecked": today})
             result["sp_updated"] = True
         return result
 
-    if bucket in ("P5", "Ignore"):
+    if bucket == "P5":
+        # FIX: previously this returned immediately with NO SharePoint write
+        # at all — meaning a P5 row's ExpiryBucket/ExpiryNotice/ExpirationDate
+        # never refreshed as time passed, even once the secret had genuinely
+        # aged into P4 or further. discovery now writes P5 secrets into
+        # SecretAlertRegistry (see v10.2), so monitoring must keep those rows
+        # current too, even though P5 still gets no alert and no ticket.
+        # Bucket transition (e.g. P5→P4) is still correctly detected on a
+        # LATER run once _handle_existing_secret sees the row already exists
+        # with ExpiryBucket=P5 but the freshly computed bucket is now P4 —
+        # this write is what keeps that comparison accurate.
+        update_fields = {
+            "LastChecked":     today,
+            "ExpiryNotice":    notice,
+            "ExpiryBucket":    bucket,
+            "ExpirationDate":  c["expiration"],
+        }
+        await write_sharepoint_row(item_id, update_fields)
+        result["sp_updated"] = True
+        return result
+
+    if bucket == "Ignore":
+        # NEW — the -8-DAY ABANDONMENT CHECK. A secret crossing into "Ignore"
+        # (8+ days past expiry) is NOT automatically moved to
+        # IgnoredSecretRegistry purely on day count — that would risk yanking
+        # a secret someone is actively rotating right now out of view. The
+        # actual decision is based on whether there's still a live, open
+        # Jira ticket for it:
+        #
+        #   - No JiraTicketKey at all           → genuinely abandoned, MOVE
+        #   - Ticket status is Canceled          → explicitly abandoned, MOVE
+        #   - Ticket status is Done/Resolved     → shouldn't still be here if
+        #                                          the Jira→SharePoint sync
+        #                                          worked (should already be
+        #                                          Rotated) — flag as a
+        #                                          possible sync-gap anomaly,
+        #                                          do NOT move, stays visible
+        #   - Ticket is In Progress/To Do/
+        #     Blocked/Awaiting Reporter          → someone is actively
+        #                                          engaged — do NOT move,
+        #                                          stays visible, marked
+        #                                          clearly as overdue-but-active
+        #   - Any other/unrecognized status       → fail SAFE, do NOT move,
+        #                                          log for manual review
+        #
+        # If move_secret_to_ignored wasn't provided by the caller (main.py),
+        # this whole check is skipped and Ignore rows just get the same
+        # plain refresh P5 gets — same as before this feature existed.
+        if move_secret_to_ignored is None:
+            update_fields = {
+                "LastChecked":     today,
+                "ExpiryNotice":    notice,
+                "ExpiryBucket":    bucket,
+                "ExpirationDate":  c["expiration"],
+            }
+            await write_sharepoint_row(item_id, update_fields)
+            result["sp_updated"] = True
+            return result
+
+        if not jira_key:
+            move_reason = "no ticket — never actioned"
+            should_move = True
+            jira_status_for_note = "none"
+        else:
+            issue = await get_jira_issue(jira_key)
+            jira_status_for_note = (issue.get("status") or "").strip()
+            status_lower = jira_status_for_note.lower()
+            if status_lower in ("canceled", "cancelled"):
+                move_reason = f"ticket {jira_key} canceled"
+                should_move = True
+            elif status_lower in ("done", "resolved"):
+                # This shouldn't normally happen — a Done/Resolved ticket
+                # should already have flipped this row to AlertStatus=Rotated
+                # via the jira-status-update sync. Finding one still sitting
+                # here past -8 days suggests that sync didn't fire for this
+                # ticket. Do NOT move it — flag it clearly instead so it gets
+                # investigated rather than silently disappearing into Ignored
+                # while still technically unrotated in SharePoint's eyes.
+                should_move = False
+                await write_sharepoint_row(item_id, {
+                    "LastChecked":  today,
+                    "ExpiryNotice": (f"⚠ SYNC GAP — Jira ticket {jira_key} is "
+                                    f"'{jira_status_for_note}' but this row was never "
+                                    f"marked Rotated. Check the Jira automation rule."),
+                })
+                result["sp_updated"] = True
+                return result
+            else:
+                # In Progress / To Do / Blocked / Awaiting Reporter / anything
+                # else recognized-but-active — someone is engaged, or the
+                # status is simply not one of the abandonment signals. Fail
+                # safe: do not move. Mark clearly as overdue-but-active so a
+                # human reviewing SecretAlertRegistry sees both facts at once.
+                should_move = False
+
+        if not should_move:
+            await write_sharepoint_row(item_id, {
+                "LastChecked":  today,
+                "ExpiryNotice": (f"OVERDUE {abs(c['days'])} days — ticket "
+                                f"{jira_key or '(none)'} still "
+                                f"'{jira_status_for_note}', not auto-ignored"),
+            })
+            result["sp_updated"] = True
+            return result
+
+        ignored_fields = {
+            "Title":             c["app_id"],
+            "AppName":           c["app_name"],
+            "SecretID":          c["secret_id"],
+            "SecretDescription": c["secret_desc"],
+            "ExpirationDate":    c["expiration"],
+            "DaysExpired":       abs(c["days"]),
+            "TenantID":          c.get("tenant_id", ""),
+            "TenantName":        c.get("tenant_id", ""),
+            "LoggedDate":        today,
+            "IgnoreReason":      f"Expired8Plus — {move_reason}",
+        }
+        move_result = await move_secret_to_ignored(item_id, ignored_fields, move_reason)
+        if move_result.get("success"):
+            result["moved_to_ignored"] = True
+            result["sp_updated"] = True
+        else:
+            result["error"] = (f"move_secret_to_ignored failed for AppID={c['app_id']} "
+                               f"SecretID={c['secret_id']}: {move_result.get('error')}")
         return result
 
     # Self-heal missing Jira ticket — only for buckets that are supposed to
