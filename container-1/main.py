@@ -5,8 +5,31 @@ Endpoints:
   GET  /health          — liveness probe
   POST /run             — trigger a governance cycle (background task — returns immediately)
   POST /chat            — conversational endpoint with per-session memory
-  POST /jira-webhook    — Jira automation trigger when ticket is resolved
   POST /teams-webhook   — Microsoft Teams Bot Service messages
+
+REMOVED in this version:
+  POST /jira-webhook — retired. This endpoint only ever recognized 3 status
+  names (done/closed/resolved) and did nothing for Canceled, Blocked, or
+  Awaiting Reporter — the exact "status change doesn't update SharePoint"
+  problem the client reported. It has been fully superseded by
+  /tools/jira-status-update on Container 2's main.py, which correctly maps
+  all six real workflow statuses (To Do, In Progress, Done, Canceled,
+  Blocked, Awaiting Reporter: Needs more information) to the right
+  SharePoint AlertStatus. The Jira automation rule ("Trigger Secret Agent
+  on Ticket Close") has been repointed to call Container 2 directly —
+  see runbook/automation notes for the exact rule setup (trigger status
+  list + request body). Leaving this endpoint in place risked someone
+  re-pointing a Jira rule at it later and silently regressing back to the
+  narrower, wrong behavior — retiring it removes that risk entirely rather
+  than leaving two endpoints that do overlapping, inconsistent jobs.
+
+  _update_sharepoint_on_close() (the helper this endpoint used) is retired
+  alongside it for the same reason — it called the OLDER
+  /tools/update_on_jira_close endpoint on Container 2, which only ever
+  handled the close case, not the full 6-status mapping. Container 2's
+  /tools/jira-status-update is now the single source of truth for every
+  Jira→SharePoint status transition, called directly by Jira automation —
+  no Container 1 involvement needed for this flow at all anymore.
 """
 
 from __future__ import annotations
@@ -167,7 +190,9 @@ Guidelines:
 - For a full monitoring cycle, call run_secret_monitoring().
 - For specific questions ("What is the status of KAN-96?", "Show secrets for App X"),
   use the targeted individual tools rather than the full cycle.
-- When a Jira ticket is closed, verify the SharePoint row and update AlertStatus to Rotated.
+- Jira ticket status changes (Done, Canceled, Blocked, Awaiting Reporter, etc.) are
+  synced to SharePoint automatically by a Jira automation rule calling Container 2
+  directly (/tools/jira-status-update) — this agent does not need to handle that flow.
 - Rotation is handled automatically by a separate Azure Automation Runbook.
 - Always respond in clear, well-formatted Markdown with ticket keys, dates, and counts.
 
@@ -317,62 +342,7 @@ async def chat(req: ChatRequest):
         log.exception("Chat request failed for session %s", req.session_id)
         raise HTTPException(status_code=500, detail=str(e))
 
-async def _update_sharepoint_on_close(jira_key: str):
-    """
-    Directly updates SharePoint when a Jira ticket closes.
-    No AI/LangChain needed — direct Container 2 API call.
-    Fast, reliable, zero rate limit risk.
-    """
-    try:
-        today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        result = await _call_monitor("update_on_jira_close", {
-            "jira_key": jira_key,
-            "today":    today,
-        })
-        log.info("SharePoint updated for %s: %s rows marked Rotated", jira_key, result.get("updated", 0))
-    except Exception as e:
-        log.exception("Failed to update SharePoint for %s: %s", jira_key, e)
-
-
-@app.post("/jira-webhook")
-async def jira_webhook(request: Request):
-    """
-    Receives Jira automation webhooks when a ticket is resolved/closed.
-    Directly updates SharePoint — NO AI/LangChain — fast and reliable.
-
-    Jira Automation setup:
-      Trigger  : Work item transitioned → To: Resolved (or Done/Closed)
-      Action   : Send web request → POST https://<fqdn>/jira-webhook
-      Body     : {"issue": {"key": "{{issue.key}}", "fields": {"status": {"name": "{{issue.status.name}}"}}}}
-    """
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
-
-    issue  = payload.get("issue", {})
-    key    = issue.get("key") or payload.get("issueKey", "Unknown")
-    status = (issue.get("fields", {}).get("status", {}).get("name") or
-              payload.get("transition", {}).get("to", {}).get("name", "")).lower()
-
-    log.info("Jira webhook received: %s → '%s'", key, status)
-
-    closed_statuses = {"done", "closed", "resolved"}
-    if status in closed_statuses:
-        log.info("Ticket %s closed — updating SharePoint directly (no AI)", key)
-        asyncio.create_task(_update_sharepoint_on_close(key))
-        return {
-            "status":  "accepted",
-            "issue":   key,
-            "action":  "sharepoint_update_triggered",
-            "message": f"SharePoint update started for {key} — no AI needed"
-        }
-
-    log.info("Ticket %s transitioned to '%s' — no action needed", key, status)
-    return {
-        "status":  "received",
-        "issue":   key,
-        "action":  "none",
-        "message": f"Transition to '{status}' does not trigger SharePoint update"
-    }
-
+# NOTE: /jira-webhook and _update_sharepoint_on_close() were REMOVED here —
+# see the module docstring at the top of this file for why. Jira automation
+# now calls Container 2's /tools/jira-status-update directly; Container 1 is
+# no longer part of the Jira→SharePoint sync path at all.
