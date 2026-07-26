@@ -11,79 +11,74 @@ Changes in this version:
     owner_email param renamed to owner_emails (list[str]) — KV value parsed
     at call site in main.py; any-of-list match against AppOwners column.
 
-  - BUCKET SCHEME REVISED (P0 removed, renumbered P1-P5):
-      P1  0-3 days   CRITICAL     Teams alert, WITH tagging of a specific person
-      P2  4-7 days   CRITICAL     Teams alert, WITHOUT tagging
-      P3  8-30 days  WARNING      Teams alert + Jira ticket
+  - BUCKET SCHEME (CORRECTED — see fix note below):
+      P1  0-3 days   CRITICAL     Jira ticket + Teams alert, WITH tagging
+      P2  4-7 days   CRITICAL     Jira ticket + Teams alert, WITHOUT tagging
+      P3  8-30 days  WARNING      Jira ticket + Teams alert
       P4  31-60 days INFORMATION  Jira ticket only (no Teams)
-      P5  61+ days   -            Safe — logged only, no SharePoint row, no alert
-                                   (this is what P4 used to mean before this
-                                   renumbering; behavior unchanged, just renamed)
-    This replaces the short-lived P0/P1 split from the previous version —
-    P0 is gone; everything shifted up by one number instead.
+      P5  61+ days   -            Safe — logged only, no SharePoint row, no
+                                   alert, no ticket
 
-  - TEAMS TAGGING (NEW): P1 alerts now @mention a specific person, whose
-    email is read from Key Vault (TEAMS-TAG-EMAIL). Adaptive Card mention
-    entities are resolved by email/UPN via the msteams entity format.
+  - FIX (this version): P1/P2 WERE INCORRECTLY EXCLUDED FROM JIRA TICKETS.
+    A prior version of this file had JIRA_TICKET_BUCKETS = {"P3", "P4",
+    "ExpiredManualReview"} — meaning a P1 (0-3 day, most urgent) or P2
+    (4-7 day) secret got a Teams alert but NO Jira ticket at all, even
+    though the actual requirement is that every bucket except P5 gets a
+    ticket. This was confirmed in production: a secret with 4 days
+    remaining (P2) sent a correctly-worded CRITICAL Teams alert but
+    JiraTicketKey stayed permanently blank, because P2 was never in the
+    set that create_jira_ticket gets called for at all — not a timing
+    bug, not a stale value, the code simply never attempted it for that
+    bucket. JIRA_TICKET_BUCKETS now includes P1 and P2. The _teams_text
+    action-required copy for P1/P2 is also corrected — it previously said
+    "no manual rotation is needed yet" / implied no ticket existed, which
+    is no longer accurate now that P1/P2 always carry one.
 
-  - SECRET VALIDITY PERIOD FROM KEY VAULT (NEW): the number of months a
-    newly rotated secret stays valid for was previously hardcoded to 12
-    in runbook_rotation.py's create_azure_secret() call. This is a
-    DIFFERENT file (rotation happens in runbook_rotation.py, not here) —
-    see that file for the actual change. Noted here since it was
-    discussed together with the bucket changes.
+  - TEAMS TAGGING: P1 alerts @mention a specific person, whose email is
+    read from Key Vault (TEAMS-TAG-EMAIL). Adaptive Card mention entities
+    are resolved by email/UPN via the msteams entity format.
 
-  - FILTER CHANGED: OWNER-EMAILS list-matching → ManualAppOwners non-blank
-    (NEW): monitoring previously only acted on rows whose AppOwners
-    matched one of a fixed list configured in Key Vault (OWNER-EMAILS).
-    That meant filling in ManualAppOwners on a SharePoint row had NO
-    effect on whether monitoring raised a Jira ticket or Teams alert for
-    it — the two columns were unrelated as far as this file was
-    concerned. Monitoring now gates on ManualAppOwners being non-blank
-    instead, both for existing SharePoint rows and for brand-new secrets
-    (checked via whether ANY existing row for that app_id already has
-    ManualAppOwners filled in). owner_emails/owner_email are still
-    accepted as parameters for backwards compatibility but are IGNORED
-    by default — set manual_owners_only=False at the call site in
-    main.py to fall back to the old AppOwners/OWNER-EMAILS behavior.
+  - SECRET VALIDITY PERIOD FROM KEY VAULT: the number of months a newly
+    rotated secret stays valid for is read from Key Vault in
+    runbook_rotation.py's create_azure_secret() call — a DIFFERENT file,
+    noted here since it was discussed together with the bucket changes.
 
-  - P5 NOW LANDS IN SecretAlertRegistry (matches runbook_discovery.py's
-    v10.2 one-time change): previously P5 rows never reached this file's
-    main loop at all, since discovery routed them to IgnoredSecretRegistry.
-    Now that discovery writes P5 into SecretAlertRegistry, _handle_existing_
-    secret's P5/Ignore branch was fixed — it previously returned immediately
-    with NO SharePoint write at all when it saw a P5/Ignore bucket, meaning
-    a P5 row's ExpiryBucket/ExpiryNotice/ExpirationDate never refreshed as
-    time passed, even once the secret had genuinely aged into P4. It now
-    still writes those three fields every run (keeping the bucket-transition
-    comparison on a LATER run accurate) while still correctly sending no
-    alert and creating no ticket for P5/Ignore.
+  - FILTER: OWNER-EMAILS list-matching → ManualAppOwners non-blank.
+    Monitoring gates on ManualAppOwners being non-blank, both for existing
+    SharePoint rows and for brand-new secrets (checked via whether ANY
+    existing row for that app_id already has ManualAppOwners filled in).
+    owner_emails/owner_email are still accepted as parameters for
+    backwards compatibility but are IGNORED by default — set
+    manual_owners_only=False at the call site in main.py to fall back to
+    the old AppOwners/OWNER-EMAILS behavior.
 
-  - MANUALAPPOWNERS APP-WIDE PROPAGATION (NEW): app ownership is a property
-    of the App Registration, not of any one secret — every secret under the
-    same app belongs to the same app. If a human fills in ManualAppOwners
-    on just ONE secret's row, every OTHER row for that same app_id is now
-    automatically backfilled with the same value on the next monitoring
-    run, rather than staying blank until someone manually fills in every
-    row individually. Runs BEFORE the ownership filter so a sibling row
+  - P5 LANDS IN SecretAlertRegistry (matches runbook_discovery.py's v10.2
+    one-time change): P5 rows get ExpiryBucket/ExpiryNotice/ExpirationDate
+    refreshed every run (so a later transition into P4 is detected
+    correctly) but still get no alert and no ticket.
+
+  - MANUALAPPOWNERS APP-WIDE PROPAGATION: app ownership is a property of
+    the App Registration, not of any one secret. If a human fills in
+    ManualAppOwners on just ONE secret's row, every OTHER row for that
+    same app_id is automatically backfilled with the same value on the
+    next monitoring run. Runs BEFORE the ownership filter so a sibling row
     backfilled this run is treated as actionable in the SAME run.
 
-  - LITERAL P1/P2/P3/P4 JIRA PRIORITIES (NEW, explicit client requirement):
-    SEVERITY_MAP's priority field for P1-P4 is now the literal bucket name
+  - LITERAL P1/P2/P3/P4 JIRA PRIORITIES (explicit client requirement):
+    SEVERITY_MAP's priority field for P1-P4 is the literal bucket name
     ("P1"/"P2"/"P3"/"P4"), not Jira's default Highest/High/Medium/Low
-    scheme. REQUIRES priorities named exactly "P1"/"P2"/"P3"/"P4" to already
-    exist in the Jira project's priority scheme — if they don't, ticket
-    creation fails with a 400 from Jira's API. ExpiredManualReview is
-    unchanged (still "Highest") — it is not one of the four buckets this
-    requirement covers.
+    scheme. REQUIRES priorities named exactly "P1"/"P2"/"P3"/"P4" to
+    already exist in the Jira project's priority scheme — if they don't,
+    ticket creation fails with a 400 from Jira's API. ExpiredManualReview
+    is unchanged (still "Highest") — it is not one of the four buckets
+    this requirement covers.
 
-  - BLOCKED / AWAITING REPORTER — PAUSED, NOT TERMINAL (NEW): matches the
-    two new statuses main.py's jira-status-update endpoint can now set
-    (see that file). A row in either state is skipped by monitoring's
-    normal escalation/alert logic (same treatment as the true terminal
-    statuses) but still gets ExpiryNotice/LastChecked refreshed each run so
-    it doesn't look abandoned, and resumes normal monitoring once the Jira
-    ticket moves to a different status.
+  - BLOCKED / AWAITING REPORTER — PAUSED, NOT TERMINAL: matches the two
+    statuses main.py's jira-status-update endpoint can set. A row in
+    either state is skipped by monitoring's normal escalation/alert logic
+    (same treatment as the true terminal statuses) but still gets
+    ExpiryNotice/LastChecked refreshed each run, and resumes normal
+    monitoring once the Jira ticket moves to a different status.
 """
 
 from __future__ import annotations
@@ -106,11 +101,11 @@ BATCH_PAUSE       = 0.5  # seconds between batches — avoids throttling
 
 def classify_bucket(days: int) -> str:
     """
-    P1  0-3 days   CRITICAL     (most urgent — Teams alert WITH tagging)
-    P2  4-7 days   CRITICAL     (Teams alert WITHOUT tagging)
-    P3  8-30 days  WARNING      (Teams alert + Jira ticket)
+    P1  0-3 days   CRITICAL     (most urgent — Jira ticket + Teams alert WITH tagging)
+    P2  4-7 days   CRITICAL     (Jira ticket + Teams alert WITHOUT tagging)
+    P3  8-30 days  WARNING      (Jira ticket + Teams alert)
     P4  31-60 days INFORMATION  (Jira ticket only)
-    P5  61+ days   SAFE         (logged only, no SharePoint row)
+    P5  61+ days   SAFE         (logged only, no SharePoint row, no ticket, no alert)
     """
     if days >= 61:       return "P5"
     if 31 <= days <= 60: return "P4"
@@ -125,8 +120,8 @@ def classify_bucket(days: int) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 TERMINAL_STATUSES    = {"Rotated", "Ignored", "Resolved"}
-# NEW — PAUSED, not permanently terminal. A row here is expected to resume
-# normal monitoring once its Jira ticket moves to a different status (the
+# PAUSED, not permanently terminal. A row here is expected to resume normal
+# monitoring once its Jira ticket moves to a different status (the
 # jira-status-update endpoint in main.py is what moves it OUT of this state
 # again, same mechanism that put it here). Distinct from TERMINAL_STATUSES:
 # terminal rows are done forever; paused rows are just quiet for now.
@@ -137,7 +132,7 @@ CLOSED_NAMES         = {"done", "closed", "resolved"}
 # Stage numbers determine escalation direction — higher stage always wins
 # when comparing against a row's current status, so a secret can only ever
 # escalate (never silently de-escalate back to a lower-urgency status).
-# P1 (0-3 days) is now the highest/most urgent stage.
+# P1 (0-3 days) is the highest/most urgent stage.
 BUCKET_STAGE = {"P4": 1, "P3": 2, "P2": 3, "P1": 4, "ExpiredManualReview": 5}
 STATUS_STAGE = {
     "JiraRaised": 1, "TeamsAlerted": 2,
@@ -150,21 +145,20 @@ ALERT_STATUS_FOR_BUCKET = {
     "P4": "JiraRaised",       # Jira ticket only
     "P3": "TeamsAlerted",     # Teams + Jira — TeamsAlerted covers both since
                               # both actions happen together for P3
-    "P2": "Escalated",        # Teams alert, no tagging
-    "P1": "CriticalTagged",   # Teams alert WITH tagging — the new top tier
+    "P2": "Escalated",        # Teams alert (no tagging) + Jira ticket
+    "P1": "CriticalTagged",   # Teams alert WITH tagging + Jira ticket — top tier
     "ExpiredManualReview": "ExpiredManualReview",
 }
 
 SEVERITY_MAP = {
-    # NEW: priority is now the LITERAL bucket name ("P1"/"P2"/"P3"/"P4"), not
-    # Jira's default Highest/High/Medium/Low scheme — explicit client
-    # requirement. This REQUIRES priorities named exactly "P1", "P2", "P3",
-    # "P4" to already exist in the Jira project's priority scheme (Jira
-    # Settings → Issues → Priorities, or the project's priority scheme) —
-    # if they don't exist yet, ticket creation will fail with a 400 from
-    # Jira's API rather than silently falling back to a default.
-    # ExpiredManualReview is NOT one of the four buckets covered by this
-    # requirement — it keeps Jira's standard "Highest" priority, unchanged.
+    # Priority is the LITERAL bucket name ("P1"/"P2"/"P3"/"P4"), not Jira's
+    # default Highest/High/Medium/Low scheme — explicit client requirement.
+    # REQUIRES priorities named exactly "P1", "P2", "P3", "P4" to already
+    # exist in the Jira project's priority scheme — if they don't exist
+    # yet, ticket creation will fail with a 400 from Jira's API rather than
+    # silently falling back to a default. ExpiredManualReview is NOT one of
+    # the four buckets covered by this requirement — it keeps Jira's
+    # standard "Highest" priority, unchanged.
     "P4": {"severity": "INFORMATION", "priority": "P4"},
     "P3": {"severity": "WARNING",     "priority": "P3"},
     "P2": {"severity": "CRITICAL",    "priority": "P2"},
@@ -184,10 +178,12 @@ TEAMS_HEADERS = {
 TEAMS_ALERT_BUCKETS       = {"P1", "P2", "P3"}
 TEAMS_TAG_BUCKETS         = {"P1"}   # only P1 tags a specific person
 
-# Which buckets create/maintain a Jira ticket. P1 and P2 are Teams-only —
-# no Jira ticket at that stage. A Jira ticket only gets raised once a
-# secret reaches P3 (or if it's already expired — ExpiredManualReview).
-JIRA_TICKET_BUCKETS       = {"P3", "P4", "ExpiredManualReview"}
+# FIX (this version): P1 and P2 ADDED. Every bucket except P5 now raises/
+# maintains a Jira ticket — P1 and P2 were previously excluded here, which
+# was the actual cause of a 4-day (P2) secret sending a correct Teams
+# alert but never getting a JiraTicketKey at all. See the module docstring
+# FIX note for the full explanation.
+JIRA_TICKET_BUCKETS       = {"P1", "P2", "P3", "P4", "ExpiredManualReview"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MESSAGE BUILDERS
@@ -205,9 +201,12 @@ def _teams_text(severity: str, c: dict, jira_key: str) -> str:
     bucket = c.get("bucket")
     if severity == "EXPIRED":
         action_req = "Password has ALREADY EXPIRED. A ticket has been raised for manual review."
-    elif bucket in ("P1", "P2"):
-        action_req = "This secret is scheduled for AUTO-ROTATION. No manual rotation is needed yet."
-    elif bucket == "P3":
+    elif bucket in ("P1", "P2", "P3"):
+        # FIX: previously P1/P2 said "no manual rotation needed yet" and
+        # implied no ticket existed — no longer accurate now that P1/P2
+        # always carry a Jira ticket, same as P3. All three Teams-alert
+        # buckets now share the same accurate copy: a ticket exists (or
+        # will, by the time this alert is read) for tracking.
         action_req = "This secret is scheduled for AUTO-ROTATION. A Jira ticket has also been raised for tracking."
     else:
         action_req = "Rotate this secret and update all dependent services."
@@ -285,10 +284,10 @@ def _build_candidates(applications: list[dict], now: datetime) -> tuple[list[dic
         app_id      = app.get("appId")
         app_name    = app.get("displayName") or "Unknown"
         creds       = app.get("passwordCredentials") or []
-        # NEW — carries the tenant this app was actually fetched from
-        # (main.py's fetch_azure_secrets() now scans multiple tenants and
-        # tags each app with _sourceTenantId, matching runbook_discovery.py's
-        # own pattern). Falls back to "" if somehow absent, so a caller that
+        # Carries the tenant this app was actually fetched from (main.py's
+        # fetch_azure_secrets() scans multiple tenants and tags each app
+        # with _sourceTenantId, matching runbook_discovery.py's own
+        # pattern). Falls back to "" if somehow absent, so a caller that
         # doesn't set this doesn't crash — write_sharepoint_row's own
         # fallback to GRAPH_TENANT_ID takes over in that case.
         source_tenant_id = app.get("_sourceTenantId", "")
@@ -341,20 +340,20 @@ async def run_secret_monitoring(
     get_jira_issue:         Callable[[str], Awaitable[dict]],
     add_jira_comment:       Callable[[str, str], Awaitable[dict]],
     send_teams_alert:       Callable[..., Awaitable[dict]],
-    move_secret_to_ignored: Callable[..., Awaitable[dict]] | None = None,  # NEW — -8-day abandoned-secret move
+    move_secret_to_ignored: Callable[..., Awaitable[dict]] | None = None,  # -8-day abandoned-secret move
     owner_emails:           list[str] | None = None,   # DEPRECATED — see manual_owners_only below
     owner_email:            str = "",                  # DEPRECATED — see manual_owners_only below
     fetch_app_owners:       Callable[[str], Awaitable[str]] | None = None,  # legacy — not used
     get_owned_app_ids:      Callable[[], Awaitable[set]] | None = None,     # legacy — not used
     teams_tag_email:        str = "",                  # person to @mention on P1 alerts (from KV)
-    manual_owners_only:     bool = True,                # NEW — filter is now "does ManualAppOwners
-                                                         # have anything in it", not an owner-email
-                                                         # match against AppOwners. owner_emails/
-                                                         # owner_email are IGNORED when this is True
-                                                         # (the default) — kept as parameters only so
-                                                         # main.py doesn't need to change its call site
-                                                         # signature immediately. Set False to restore
-                                                         # the old AppOwners/OWNER_EMAILS matching.
+    manual_owners_only:     bool = True,                # filter is "does ManualAppOwners have
+                                                         # anything in it", not an owner-email match
+                                                         # against AppOwners. owner_emails/owner_email
+                                                         # are IGNORED when this is True (the default)
+                                                         # — kept as parameters only so main.py doesn't
+                                                         # need to change its call site signature
+                                                         # immediately. Set False to restore the old
+                                                         # AppOwners/OWNER_EMAILS matching.
 ) -> dict:
     now   = datetime.now(timezone.utc)
     today = now.strftime("%Y-%m-%d")
@@ -370,8 +369,8 @@ async def run_secret_monitoring(
         "jiraComments":    0,
         "sharepointCreated": 0,
         "sharepointUpdated": 0,
-        "manualOwnersPropagated": 0,   # NEW — sibling rows backfilled with an app-wide ManualAppOwners value
-        "movedToIgnored": 0,           # NEW — abandoned secrets (-8+ days, no ticket or Canceled) moved to IgnoredSecretRegistry
+        "manualOwnersPropagated": 0,   # sibling rows backfilled with an app-wide ManualAppOwners value
+        "movedToIgnored": 0,           # abandoned secrets (-8+ days, no ticket or Canceled) moved to IgnoredSecretRegistry
         "errors": [],
     }
 
@@ -388,7 +387,7 @@ async def run_secret_monitoring(
         summary["errors"].append(f"get_sharepoint_state failed: {e}")
         return summary
 
-    # ── NEW: propagate ManualAppOwners app-wide, BEFORE filtering ─────────────
+    # ── Propagate ManualAppOwners app-wide, BEFORE filtering ──────────────────
     # App ownership is a property of the APP REGISTRATION, not of any one
     # secret — every secret under the same app belongs to the same app. If a
     # human fills in ManualAppOwners on just ONE secret's row, every OTHER
@@ -432,16 +431,17 @@ async def run_secret_monitoring(
         summary["manualOwnersPropagated"] = 0
 
     # ── Build SharePoint index ────────────────────────────────────────────────
-    # FILTER CHANGE: monitoring now only processes rows where ManualAppOwners
-    # is non-blank — this is a deliberate opt-in gate, not the old "does
-    # AppOwners match one of a fixed OWNER_EMAILS list from Key Vault" check.
-    # ManualAppOwners is admin-filled per app (see runbook_discovery.py — it
-    # is the one column discovery itself never writes to), so a row only
-    # becomes actionable once a human has explicitly marked that app for
-    # monitoring/rotation. owner_emails/owner_email are ignored entirely when
-    # manual_owners_only is True (the default). Thanks to the propagation
-    # step just above, a sibling row backfilled THIS run is already reflected
-    # in sp_data's in-memory fields by the time this filter runs.
+    # Monitoring only processes rows where ManualAppOwners is non-blank —
+    # this is a deliberate opt-in gate, not the old "does AppOwners match
+    # one of a fixed OWNER_EMAILS list from Key Vault" check. ManualAppOwners
+    # is admin-filled per app (see runbook_discovery.py — it is the one
+    # column discovery itself never writes to), so a row only becomes
+    # actionable once a human has explicitly marked that app for
+    # monitoring/rotation. owner_emails/owner_email are ignored entirely
+    # when manual_owners_only is True (the default). Thanks to the
+    # propagation step just above, a sibling row backfilled THIS run is
+    # already reflected in sp_data's in-memory fields by the time this
+    # filter runs.
     if manual_owners_only:
         effective_owners: list[str] = []   # unused in this mode, kept for the old branch below
     elif owner_emails:
@@ -486,7 +486,7 @@ async def run_secret_monitoring(
         summary["totalsByBucket"][c["bucket"]] += 1
 
     # ── Build app ManualAppOwners map from SP for ownership check on new secrets ─
-    # Keyed off ManualAppOwners now, not AppOwners — see the FILTER CHANGE note
+    # Keyed off ManualAppOwners now, not AppOwners — see the FILTER note
     # above. A brand-new secret for an app that already has ManualAppOwners
     # filled in on ANY of its existing rows is treated as actionable, same as
     # discovery/rotation already treat ManualAppOwners as an app-level (not
@@ -514,10 +514,8 @@ async def run_secret_monitoring(
             existing_secrets.append((c, existing))
 
     # ── PHASE 1: Create Jira tickets for new secrets (batched) ───────────────
-    # Only P3/P4/ExpiredManualReview raise a Jira ticket. P1/P2 are
-    # Teams-only at this stage — a ticket only appears once the secret
-    # ages into P3 on a later run (handled by the escalation logic in
-    # _handle_existing_secret for rows that already exist).
+    # Every bucket except P5/Ignore raises/maintains a Jira ticket now —
+    # see JIRA_TICKET_BUCKETS and the module docstring FIX note.
     def _is_owned_new(c: dict) -> bool:
         if manual_owners_only:
             # A new secret is actionable only if ITS app already has a
@@ -586,8 +584,11 @@ async def run_secret_monitoring(
         elif res["jira_key"]:
             summary["newJiraTickets"] += 1
 
-    # Teams-only new secrets (P1/P2) never get a jira_key — build the same
-    # result shape as jira_results so both flow through the same write path.
+    # Teams-only new secrets never get a jira_key here — with the fix, this
+    # list will normally be empty (only P5/Ignore are excluded from
+    # JIRA_TICKET_BUCKETS, and both are already excluded from actionable_new
+    # entirely) — kept for structural safety in case JIRA_TICKET_BUCKETS is
+    # ever narrowed again in the future.
     teams_only_results = [
         {"c": c, "jira_key": "", "sev": SEVERITY_MAP[c["bucket"]], "error": None}
         for c in teams_only_new
@@ -615,12 +616,12 @@ async def run_secret_monitoring(
             "AlertHistory":       f"[{today}] Alert generated at severity {bucket}.",
             "AppOwners":          c.get("app_owners", ""),
         }
-        # NEW — stamp the ACTUAL tenant this app was scanned from, not just
+        # Stamp the ACTUAL tenant this app was scanned from, not just
         # whatever write_sharepoint_row's own GRAPH_TENANT_ID fallback would
         # use. Only set if _build_candidates actually carried a tenant_id
-        # through (see FIX #2 above) — an empty string here would overwrite
-        # write_sharepoint_row's fallback with nothing, so we only include
-        # these keys when there's a real value.
+        # through — an empty string here would overwrite write_sharepoint_
+        # row's fallback with nothing, so we only include these keys when
+        # there's a real value.
         if c.get("tenant_id"):
             fields["TenantID"]   = c["tenant_id"]
             fields["TenantName"] = c["tenant_id"]
@@ -724,7 +725,7 @@ async def _handle_existing_secret(
                     "moved_to_ignored": False, "error": None}
 
     if alert_status in MONITOR_SKIP_STATUSES:
-        # RotatedPendingDeployment and the new PAUSED_STATUSES (Blocked,
+        # RotatedPendingDeployment and the PAUSED_STATUSES (Blocked,
         # AwaitingReporter) still get their ExpiryNotice/LastChecked
         # refreshed each run — so the row doesn't look abandoned/stale in
         # SharePoint — but get NO alert, ticket, or escalation activity.
@@ -736,16 +737,10 @@ async def _handle_existing_secret(
         return result
 
     if bucket == "P5":
-        # FIX: previously this returned immediately with NO SharePoint write
-        # at all — meaning a P5 row's ExpiryBucket/ExpiryNotice/ExpirationDate
-        # never refreshed as time passed, even once the secret had genuinely
-        # aged into P4 or further. discovery now writes P5 secrets into
-        # SecretAlertRegistry (see v10.2), so monitoring must keep those rows
-        # current too, even though P5 still gets no alert and no ticket.
-        # Bucket transition (e.g. P5→P4) is still correctly detected on a
-        # LATER run once _handle_existing_secret sees the row already exists
-        # with ExpiryBucket=P5 but the freshly computed bucket is now P4 —
-        # this write is what keeps that comparison accurate.
+        # P5 rows still get ExpiryBucket/ExpiryNotice/ExpirationDate
+        # refreshed every run — so a LATER transition into P4 is detected
+        # correctly by the stage comparison below — but get no alert and
+        # no ticket, same as always.
         update_fields = {
             "LastChecked":     today,
             "ExpiryNotice":    notice,
@@ -757,12 +752,12 @@ async def _handle_existing_secret(
         return result
 
     if bucket == "Ignore":
-        # NEW — the -8-DAY ABANDONMENT CHECK. A secret crossing into "Ignore"
+        # The -8-DAY ABANDONMENT CHECK. A secret crossing into "Ignore"
         # (8+ days past expiry) is NOT automatically moved to
-        # IgnoredSecretRegistry purely on day count — that would risk yanking
-        # a secret someone is actively rotating right now out of view. The
-        # actual decision is based on whether there's still a live, open
-        # Jira ticket for it:
+        # IgnoredSecretRegistry purely on day count — that would risk
+        # yanking a secret someone is actively rotating right now out of
+        # view. The actual decision is based on whether there's still a
+        # live, open Jira ticket for it:
         #
         #   - No JiraTicketKey at all           → genuinely abandoned, MOVE
         #   - Ticket status is Canceled          → explicitly abandoned, MOVE
@@ -861,9 +856,11 @@ async def _handle_existing_secret(
                                f"SecretID={c['secret_id']}: {move_result.get('error')}")
         return result
 
-    # Self-heal missing Jira ticket — only for buckets that are supposed to
-    # have one (P3/P4/ExpiredManualReview). P1/P2 never get a ticket, so
-    # there's nothing to self-heal there.
+    # Self-heal missing Jira ticket — now applies to EVERY bucket that
+    # should have one: P1, P2, P3, P4, ExpiredManualReview. Previously this
+    # only fired for P3/P4/ExpiredManualReview, matching the old (wrong)
+    # JIRA_TICKET_BUCKETS — now that P1/P2 are included, a P1/P2 row that
+    # somehow lost/never got its ticket is self-healed here too.
     if not jira_key and bucket in JIRA_TICKET_BUCKETS and bucket in SEVERITY_MAP:
         sev   = SEVERITY_MAP[bucket]
         issue = await create_jira_ticket(
@@ -894,16 +891,16 @@ async def _handle_existing_secret(
     if current_stage is not None and current_stage > existing_stage:
         sev = SEVERITY_MAP[bucket]
 
-        # A secret escalating INTO a Jira-ticket bucket (P3/P4) for the
-        # first time needs a ticket created now, even if it started life
-        # as a Teams-only P1/P2 secret with no ticket yet.
+        # A secret escalating into ANY ticket-eligible bucket (now including
+        # P1/P2) for the first time needs a ticket created now, even if it
+        # somehow reached this point with no ticket yet.
         if not jira_key and bucket in JIRA_TICKET_BUCKETS:
             issue = await create_jira_ticket(
                 app_name=c["app_name"], app_id=c["app_id"],
                 secret_id=c["secret_id"], secret_description=c["secret_desc"],
                 expiration_date=c["expiration"], days_remaining=c["days"],
                 severity=sev["severity"], priority=sev["priority"],
-                extra_note="Escalated from Teams-only tier — ticket created at this stage.",
+                extra_note="Escalated — ticket created at this stage.",
             )
             jira_key = issue.get("issue_key", "")
             if jira_key:
