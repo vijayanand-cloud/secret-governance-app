@@ -28,6 +28,31 @@ _kv            = SecretClient(vault_url=KV_URL, credential=_credential)
 def _kv_get(n: str) -> str:
     return _kv.get_secret(n).value
 
+async def get_product_service_principal(product_name: str) -> str | None:
+    """
+    Looks up a Key Vault secret literally named after product_name (e.g. a
+    secret called "ProductA") and returns its value, a service principal
+    name, or None if no such secret exists in this vault.
+
+    This is how the ProductName column in SharePoint gets translated into a
+    ManualAppOwners value automatically — the team maintains one Key Vault
+    secret per product they support, secret name is the product name, secret
+    value is that product's service principal. Adding a new product later is
+    just creating one more secret, no code change needed.
+
+    A missing secret is NOT an error — Key Vault's SDK raises an exception
+    for "secret not found", which is expected and normal here whenever
+    ProductName contains a typo or a product that hasn't been registered yet.
+    That case returns None rather than propagating the exception, so one
+    unrecognized product name in one row doesn't fail the whole monitoring run.
+    """
+    try:
+        return _kv.get_secret(product_name).value
+    except Exception as e:
+        log.info("get_product_service_principal: no Key Vault secret found for "
+                 "product %r (or lookup failed): %s", product_name, e)
+        return None
+
 GRAPH_TENANT_ID    = _kv_get("GRAPH-TENANT-ID")
 GRAPH_TENANT_NAME  = _kv_get("GRAPH-TENANT-NAME")  # from KV — no Directory.Read.All needed
 # OWNER-EMAILS supports multiple owners — comma-separated in KV
@@ -536,16 +561,17 @@ async def api_send_teams_alert(req: TeamsReq): return await send_teams_alert(req
 @app.post("/tools/run_secret_monitoring")
 async def api_run_monitoring():
     return await _run_secret_monitoring(
-        fetch_azure_secrets    = fetch_azure_secrets,
-        get_sharepoint_state   = get_sharepoint_state,
-        write_sharepoint_row   = write_sharepoint_row,
-        create_jira_ticket     = create_jira_ticket,
-        get_jira_issue         = get_jira_issue,
-        add_jira_comment       = add_jira_comment,
-        send_teams_alert       = send_teams_alert,
-        move_secret_to_ignored = move_secret_to_ignored,  # NEW — -8-day abandoned-secret move
-        owner_emails           = OWNER_EMAILS,       # IGNORED by default — see manual_owners_only in decision_engine.py
-        teams_tag_email        = TEAMS_TAG_EMAIL,    # NEW — person @mentioned on P1 alerts, from KV TEAMS-TAG-EMAIL
+        fetch_azure_secrets           = fetch_azure_secrets,
+        get_sharepoint_state          = get_sharepoint_state,
+        write_sharepoint_row          = write_sharepoint_row,
+        create_jira_ticket            = create_jira_ticket,
+        get_jira_issue                = get_jira_issue,
+        add_jira_comment              = add_jira_comment,
+        send_teams_alert              = send_teams_alert,
+        move_secret_to_ignored        = move_secret_to_ignored,
+        get_product_service_principal = get_product_service_principal,  # NEW — ProductName -> ManualAppOwners lookup
+        owner_emails                  = OWNER_EMAILS,       # IGNORED by default — see manual_owners_only in decision_engine.py
+        teams_tag_email               = TEAMS_TAG_EMAIL,    # person @mentioned on P1 alerts, from KV TEAMS-TAG-EMAIL
     )
 
 class JiraCloseReq(BaseModel):
