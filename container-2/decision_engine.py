@@ -79,6 +79,21 @@ Changes in this version:
     (same treatment as the true terminal statuses) but still gets
     ExpiryNotice/LastChecked refreshed each run, and resumes normal
     monitoring once the Jira ticket moves to a different status.
+
+  - BUCKET RENUMBERING TO FOUR BUCKETS (this version): the previous
+    five-bucket scheme (P1=0-3, P2=4-7, P3=8-30, P4=31-60, P5=61+ safe)
+    is replaced with four buckets. P1 and P2 are merged into one bucket,
+    P1, covering 0-7 days total — the tagging-vs-plain-alert distinction
+    that used to be the P1/P2 boundary is now an internal decision made
+    by should_tag_p1(), based on the actual day count, not a separate
+    bucket. P2=8-30, P3=31-60, P4=61+ safe. Jira priority names already
+    existed as P1 through P4 in the Jira project, so no new priorities
+    needed creating — only the day ranges each name maps to have moved.
+    Fixed alongside this: Phase 3 (brand-new secrets in the safe bucket)
+    previously only logged to console with NO SharePoint write at all,
+    inconsistent with how an ALREADY-EXISTING row in that same bucket was
+    treated (which did get written/refreshed). Both paths now write
+    consistently.
 """
 
 from __future__ import annotations
@@ -101,19 +116,40 @@ BATCH_PAUSE       = 0.5  # seconds between batches — avoids throttling
 
 def classify_bucket(days: int) -> str:
     """
-    P1  0-3 days   CRITICAL     (most urgent — Jira ticket + Teams alert WITH tagging)
-    P2  4-7 days   CRITICAL     (Jira ticket + Teams alert WITHOUT tagging)
-    P3  8-30 days  WARNING      (Jira ticket + Teams alert)
-    P4  31-60 days INFORMATION  (Jira ticket only)
-    P5  61+ days   SAFE         (logged only, no SharePoint row, no ticket, no alert)
+    P1  0-7 days   CRITICAL     (Jira ticket + Teams alert. 0-3 days ALSO tags a
+                                  specific person; 4-7 days is a plain Teams alert
+                                  with no tag. Both are still bucket P1.)
+    P2  8-30 days  WARNING      (Jira ticket + Teams alert)
+    P3  31-60 days INFORMATION  (Jira ticket only, no Teams alert)
+    P4  61+ days   SAFE         (logged only, no alert, no ticket, no rotation)
+
+    NOTE (renumbering): this replaces an earlier five-bucket scheme
+    (P1=0-3, P2=4-7, P3=8-30, P4=31-60, P5=61+). P1 and P2 have been merged
+    into a single P1 covering 0-7 days — the tagging-vs-plain-alert split
+    that used to be the P1/P2 boundary is now an internal decision WITHIN
+    P1, made by should_tag_p1() below, not a separate bucket. Every bucket
+    name below P1 has shifted down by one number: old P3 is now P2, old P4
+    is now P3, old P5 (safe) is now P4. Jira priority names in SEVERITY_MAP
+    already exist as P1 through P4 in the Jira project, so no new priority
+    names need to be created for this change, only the day ranges they map
+    to have moved.
     """
-    if days >= 61:       return "P5"
-    if 31 <= days <= 60: return "P4"
-    if 8  <= days <= 30: return "P3"
-    if 4  <= days <= 7:  return "P2"
-    if 0  <= days <= 3:  return "P1"
+    if days >= 61:       return "P4"
+    if 31 <= days <= 60: return "P3"
+    if 8  <= days <= 30: return "P2"
+    if 0  <= days <= 7:  return "P1"
     if -7 <= days <= -1: return "ExpiredManualReview"
     return "Ignore"
+
+def should_tag_p1(days: int) -> bool:
+    """
+    Within bucket P1 (0-7 days), only the more urgent half, 0-3 days, tags a
+    specific person in the Teams alert. 4-7 days still sends a Teams alert
+    and still raises a Jira ticket, exactly like 0-3 days does, it just does
+    not tag anyone. This is a decision based on the raw day count, not on
+    bucket membership, since both halves share the same bucket name P1.
+    """
+    return 0 <= days <= 3
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STATE MAPS
@@ -132,8 +168,8 @@ CLOSED_NAMES         = {"done", "closed", "resolved"}
 # Stage numbers determine escalation direction — higher stage always wins
 # when comparing against a row's current status, so a secret can only ever
 # escalate (never silently de-escalate back to a lower-urgency status).
-# P1 (0-3 days) is the highest/most urgent stage.
-BUCKET_STAGE = {"P4": 1, "P3": 2, "P2": 3, "P1": 4, "ExpiredManualReview": 5}
+# P1 (0-7 days) is the highest/most urgent stage.
+BUCKET_STAGE = {"P3": 1, "P2": 2, "P1": 3, "ExpiredManualReview": 4}
 STATUS_STAGE = {
     "JiraRaised": 1, "TeamsAlerted": 2,
     "Escalated": 3, "CriticalTagged": 4,
@@ -141,14 +177,20 @@ STATUS_STAGE = {
 }
 
 # What AlertStatus gets set to when a bucket's action succeeds.
+# P1 covers BOTH the tagged (0-3 day) and untagged (4-7 day) cases — which
+# one actually happened is decided at the point AlertStatus is set, using
+# should_tag_p1() against the secret's actual day count, not hardcoded here.
 ALERT_STATUS_FOR_BUCKET = {
-    "P4": "JiraRaised",       # Jira ticket only
-    "P3": "TeamsAlerted",     # Teams + Jira — TeamsAlerted covers both since
-                              # both actions happen together for P3
-    "P2": "Escalated",        # Teams alert (no tagging) + Jira ticket
-    "P1": "CriticalTagged",   # Teams alert WITH tagging + Jira ticket — top tier
+    "P3": "JiraRaised",       # Jira ticket only
+    "P2": "TeamsAlerted",     # Teams + Jira — TeamsAlerted covers both since
+                              # both actions happen together for P2
+    "P1": "Escalated",        # Teams alert (untagged, 4-7 days) + Jira ticket —
+                              # overridden to CriticalTagged below when the
+                              # secret is actually in the 0-3 day tagged half
     "ExpiredManualReview": "ExpiredManualReview",
 }
+ALERT_STATUS_P1_TAGGED = "CriticalTagged"  # used instead of ALERT_STATUS_FOR_BUCKET["P1"]
+                                            # specifically when should_tag_p1() is True
 
 SEVERITY_MAP = {
     # Priority is the LITERAL bucket name ("P1"/"P2"/"P3"/"P4"), not Jira's
@@ -158,10 +200,11 @@ SEVERITY_MAP = {
     # yet, ticket creation will fail with a 400 from Jira's API rather than
     # silently falling back to a default. ExpiredManualReview is NOT one of
     # the four buckets covered by this requirement — it keeps Jira's
-    # standard "Highest" priority, unchanged.
-    "P4": {"severity": "INFORMATION", "priority": "P4"},
-    "P3": {"severity": "WARNING",     "priority": "P3"},
-    "P2": {"severity": "CRITICAL",    "priority": "P2"},
+    # standard "Highest" priority, unchanged. These four priority NAMES are
+    # unchanged by the bucket renumbering — only the day ranges that map to
+    # each name have moved, so nothing needs to change in Jira itself.
+    "P3": {"severity": "INFORMATION", "priority": "P3"},
+    "P2": {"severity": "WARNING",     "priority": "P2"},
     "P1": {"severity": "CRITICAL",    "priority": "P1"},
     "ExpiredManualReview": {"severity": "EXPIRED", "priority": "Highest"},
 }
@@ -172,18 +215,15 @@ TEAMS_HEADERS = {
     "EXPIRED":  "⛔ EXPIRED — MANUAL REVIEW REQUIRED",
 }
 
-# Which buckets get a Teams alert at all, and whether that alert tags a
-# specific person. P4 (Jira-only) and ExpiredManualReview (ticket-only,
-# handled separately) do NOT send Teams alerts.
-TEAMS_ALERT_BUCKETS       = {"P1", "P2", "P3"}
-TEAMS_TAG_BUCKETS         = {"P1"}   # only P1 tags a specific person
+# Which buckets get a Teams alert at all. P3 (Jira-only) and
+# ExpiredManualReview (ticket-only, handled separately) do NOT send Teams
+# alerts. Whether a P1 alert specifically tags someone is now a per-secret
+# decision, see should_tag_p1() above, not a separate bucket membership
+# check the way TEAMS_TAG_BUCKETS used to work.
+TEAMS_ALERT_BUCKETS       = {"P1", "P2"}
 
-# FIX (this version): P1 and P2 ADDED. Every bucket except P5 now raises/
-# maintains a Jira ticket — P1 and P2 were previously excluded here, which
-# was the actual cause of a 4-day (P2) secret sending a correct Teams
-# alert but never getting a JiraTicketKey at all. See the module docstring
-# FIX note for the full explanation.
-JIRA_TICKET_BUCKETS       = {"P1", "P2", "P3", "P4", "ExpiredManualReview"}
+# Every bucket except P4 (safe) raises/maintains a Jira ticket.
+JIRA_TICKET_BUCKETS       = {"P1", "P2", "P3", "ExpiredManualReview"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MESSAGE BUILDERS
@@ -341,6 +381,12 @@ async def run_secret_monitoring(
     add_jira_comment:       Callable[[str, str], Awaitable[dict]],
     send_teams_alert:       Callable[..., Awaitable[dict]],
     move_secret_to_ignored: Callable[..., Awaitable[dict]] | None = None,  # -8-day abandoned-secret move
+    get_product_service_principal: Callable[[str], Awaitable[str | None]] | None = None,
+                                                         # NEW — looks up a Key Vault secret literally
+                                                         # named after ProductName and returns its value
+                                                         # (a service principal name), or None if no such
+                                                         # secret exists. See the ProductName lookup step
+                                                         # below for how this is used.
     owner_emails:           list[str] | None = None,   # DEPRECATED — see manual_owners_only below
     owner_email:            str = "",                  # DEPRECATED — see manual_owners_only below
     fetch_app_owners:       Callable[[str], Awaitable[str]] | None = None,  # legacy — not used
@@ -361,8 +407,8 @@ async def run_secret_monitoring(
     summary: dict[str, Any] = {
         "runDate": today,
         "secretsScanned": 0,
-        "totalsByBucket":  {b: 0 for b in ["P5", "P4", "P3", "P2", "P1", "ExpiredManualReview", "Ignore"]},
-        "p5LoggedOnly":    0,   # P5 secrets — logged only, no SharePoint entry
+        "totalsByBucket":  {b: 0 for b in ["P4", "P3", "P2", "P1", "ExpiredManualReview", "Ignore"]},
+        "p4LoggedOnly":    0,   # P4 secrets (61+ days, safe) — logged only, no SharePoint entry
         "skippedNotOwned": 0,   # secrets skipped — app not owned by owner_email
         "newJiraTickets":  0,
         "newTeamsAlerts":  0,
@@ -370,6 +416,8 @@ async def run_secret_monitoring(
         "sharepointCreated": 0,
         "sharepointUpdated": 0,
         "manualOwnersPropagated": 0,   # sibling rows backfilled with an app-wide ManualAppOwners value
+        "productLookupsApplied": 0,    # NEW — ManualAppOwners set/overwritten from a ProductName lookup
+        "productLookupsNotFound": 0,   # NEW — ProductName was filled in, but no matching KV secret exists
         "movedToIgnored": 0,           # abandoned secrets (-8+ days, no ticket or Canceled) moved to IgnoredSecretRegistry
         "errors": [],
     }
@@ -386,6 +434,57 @@ async def run_secret_monitoring(
     except Exception as e:
         summary["errors"].append(f"get_sharepoint_state failed: {e}")
         return summary
+
+    # ── ProductName lookup, BEFORE propagation and BEFORE filtering ───────────
+    # A row can have ProductName filled in instead of ManualAppOwners being
+    # typed in directly. If it is, look up a Key Vault secret literally named
+    # after that product (e.g. a secret called "ProductA") and use its value,
+    # a service principal name, as ManualAppOwners for this row. This ALWAYS
+    # overwrites whatever is currently in ManualAppOwners for that row — a
+    # deliberate choice, ProductName is meant to be the team's single source
+    # of truth going forward, so it always wins over a value someone may have
+    # typed in directly the old way. Runs before the propagation step below,
+    # so a value written here can still be propagated to sibling rows for the
+    # same app in the same run.
+    if get_product_service_principal is not None:
+        product_lookup_ops: list[tuple[str, dict]] = []
+        seen_products: dict[str, str | None] = {}  # cache — avoid repeat KV reads for the same product
+
+        for item in sp_data.get("items", []):
+            f       = item.get("fields", {})
+            item_id = item.get("id")
+            product = (f.get("ProductName") or "").strip()
+            if not product:
+                continue
+
+            if product not in seen_products:
+                try:
+                    seen_products[product] = await get_product_service_principal(product)
+                except Exception as e:
+                    summary["errors"].append(f"ProductName lookup failed for {product!r}: {e}")
+                    seen_products[product] = None
+
+            service_principal = seen_products[product]
+            if service_principal:
+                product_lookup_ops.append((item_id, {"ManualAppOwners": service_principal}))
+                # Update in-memory too, so propagation and filtering below see
+                # this immediately rather than the stale value from before.
+                f["ManualAppOwners"] = service_principal
+            else:
+                summary["productLookupsNotFound"] += 1
+                log_msg = (f"[INFO] ProductName {product!r} has no matching Key Vault secret — "
+                          f"ManualAppOwners left as-is for this row")
+                print(log_msg)
+
+        if product_lookup_ops:
+            print(f"[INFO] Applying ProductName lookups to {len(product_lookup_ops)} row(s)")
+            product_tasks   = [write_sharepoint_row(iid, flds) for iid, flds in product_lookup_ops]
+            product_results = await _run_batched(product_tasks, SP_WRITE_BATCH)
+            product_ok = sum(1 for r in product_results if not isinstance(r, Exception))
+            summary["productLookupsApplied"] = product_ok
+            for r in product_results:
+                if isinstance(r, Exception):
+                    summary["errors"].append(f"ProductName lookup write failed: {r}")
 
     # ── Propagate ManualAppOwners app-wide, BEFORE filtering ──────────────────
     # App ownership is a property of the APP REGISTRATION, not of any one
@@ -535,11 +634,11 @@ async def run_secret_monitoring(
 
     actionable_new = [
         c for c in new_secrets
-        if c["bucket"] not in ("P5", "Ignore") and _is_owned_new(c)
+        if c["bucket"] not in ("P4", "Ignore") and _is_owned_new(c)
     ]
     skipped_new_not_owned = len([
         c for c in new_secrets
-        if c["bucket"] not in ("P5", "Ignore") and not _is_owned_new(c)
+        if c["bucket"] not in ("P4", "Ignore") and not _is_owned_new(c)
     ])
     if skipped_new_not_owned:
         summary["skippedNotOwned"] += skipped_new_not_owned
@@ -631,15 +730,20 @@ async def run_secret_monitoring(
         teams_sent = False
         if bucket in TEAMS_ALERT_BUCKETS:
             try:
-                text      = _teams_text(sev["severity"], c, jira_key)
-                tag_email = teams_tag_email if bucket in TEAMS_TAG_BUCKETS else None
-                result    = await send_teams_alert(text, tag_email=tag_email)
+                text        = _teams_text(sev["severity"], c, jira_key)
+                # Whether to tag someone is now a day-count decision WITHIN
+                # bucket P1 (0-3 tags, 4-7 does not), not a bucket-membership
+                # check — both halves are bucket P1, see should_tag_p1().
+                tag_this    = bucket == "P1" and should_tag_p1(c["days"])
+                tag_email   = teams_tag_email if tag_this else None
+                result      = await send_teams_alert(text, tag_email=tag_email)
+                resolved_status = ALERT_STATUS_P1_TAGGED if tag_this else ALERT_STATUS_FOR_BUCKET.get(bucket, "JiraRaised")
                 if result.get("success"):
-                    fields["AlertStatus"]   = ALERT_STATUS_FOR_BUCKET[bucket]
+                    fields["AlertStatus"]   = resolved_status
                     fields["AlertSentDate"] = today
                     teams_sent = True
                 else:
-                    fields["AlertStatus"] = ALERT_STATUS_FOR_BUCKET.get(bucket, "JiraRaised")
+                    fields["AlertStatus"] = resolved_status
             except Exception as e:
                 fields["AlertStatus"] = ALERT_STATUS_FOR_BUCKET.get(bucket, "JiraRaised")
                 return {"action": "sp_created", "teams": False, "error": f"Teams alert failed: {e}"}
@@ -666,13 +770,50 @@ async def run_secret_monitoring(
             if res.get("teams"):
                 summary["newTeamsAlerts"] += 1
 
-    # ── PHASE 3: Handle P5 new secrets — log only, NO SharePoint entry ─────────
-    p5_new = [c for c in new_secrets if c["bucket"] == "P5"]
-    if p5_new:
-        summary["p5LoggedOnly"] += len(p5_new)
-        print(f"[INFO] P5 secrets (61+ days safe): {len(p5_new)} found — logged only, no SharePoint entry")
-        for c in p5_new[:5]:  # log first 5 for visibility
-            print(f"  P5: {c['app_name']} ({c['app_id']}) — expires in {c['days']} days")
+    # ── PHASE 3: Handle P4 new secrets (61+ days, safe) — written to SharePoint,
+    #            no alert, no ticket ────────────────────────────────────────────
+    # NOTE: this bucket still gets a SharePoint row, matching the
+    # existing-secret handler's own P4 branch below and the module docstring.
+    # An earlier version of this phase only logged these to the console with
+    # NO SharePoint write at all, which was inconsistent with how an
+    # ALREADY-EXISTING P4 row is treated once it exists — fixed here so a
+    # brand new P4 secret and an existing P4 secret are written the same way.
+    p4_new = [c for c in new_secrets if c["bucket"] == "P4"]
+    if p4_new:
+        summary["p4LoggedOnly"] += len(p4_new)
+        print(f"[INFO] P4 secrets (61+ days safe): {len(p4_new)} found — writing to SharePoint, no alert or ticket")
+
+        async def _write_p4_new(c: dict):
+            fields = {
+                "Title":             c["app_id"],
+                "AppName":           c["app_name"],
+                "SecretID":          c["secret_id"],
+                "SecretDescription": c["secret_desc"],
+                "ExpirationDate":    c["expiration"],
+                "ExpiryBucket":      c["bucket"],
+                "ExpiryNotice":      _expiry_notice(c["days"]),
+                "LastChecked":       today,
+                "AlertStatus":       "Discovered",
+                "AppOwners":         c.get("app_owners", ""),
+            }
+            if c.get("tenant_id"):
+                fields["TenantID"]   = c["tenant_id"]
+                fields["TenantName"] = c["tenant_id"]
+            try:
+                await write_sharepoint_row(None, fields)
+                return {"error": None}
+            except Exception as e:
+                return {"error": f"P4 new-secret SP write failed for {c['app_id']}: {e}"}
+
+        p4_tasks   = [_write_p4_new(c) for c in p4_new]
+        p4_results = await _run_batched(p4_tasks, SP_WRITE_BATCH)
+        for res in p4_results:
+            if isinstance(res, Exception):
+                summary["errors"].append(f"P4 new-secret batch error: {res}")
+            elif res.get("error"):
+                summary["errors"].append(res["error"])
+            else:
+                summary["sharepointCreated"] += 1
 
     # ── PHASE 4: Handle existing secrets (batched) ────────────────────────────
     async def _process_existing(c: dict, existing: dict):
@@ -736,11 +877,12 @@ async def _handle_existing_secret(
             result["sp_updated"] = True
         return result
 
-    if bucket == "P5":
-        # P5 rows still get ExpiryBucket/ExpiryNotice/ExpirationDate
-        # refreshed every run — so a LATER transition into P4 is detected
-        # correctly by the stage comparison below — but get no alert and
-        # no ticket, same as always.
+    if bucket == "P4":
+        # P4 rows (61+ days, safe) still get ExpiryBucket/ExpiryNotice/
+        # ExpirationDate refreshed every run — so a LATER transition into
+        # P3 (31-60 days, once the secret has aged) is detected correctly
+        # by the stage comparison below — but get no alert and no ticket,
+        # same as always.
         update_fields = {
             "LastChecked":     today,
             "ExpiryNotice":    notice,
@@ -926,11 +1068,13 @@ async def _handle_existing_secret(
                 update_fields["JiraTicketCreatedDate"] = today
 
         if bucket in TEAMS_ALERT_BUCKETS:
-            text      = _teams_text(sev["severity"], c, jira_key)
-            tag_email = teams_tag_email if bucket in TEAMS_TAG_BUCKETS else None
-            res_t     = await send_teams_alert(text, tag_email=tag_email)
+            text        = _teams_text(sev["severity"], c, jira_key)
+            tag_this    = bucket == "P1" and should_tag_p1(c["days"])
+            tag_email   = teams_tag_email if tag_this else None
+            res_t       = await send_teams_alert(text, tag_email=tag_email)
+            resolved_status = ALERT_STATUS_P1_TAGGED if tag_this else ALERT_STATUS_FOR_BUCKET.get(bucket, "JiraRaised")
             if res_t.get("success"):
-                update_fields["AlertStatus"]   = ALERT_STATUS_FOR_BUCKET[bucket]
+                update_fields["AlertStatus"]   = resolved_status
                 update_fields["AlertSentDate"] = today
                 result["teams_sent"] = True
             else:
