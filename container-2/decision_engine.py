@@ -198,15 +198,19 @@ SEVERITY_MAP = {
     # REQUIRES priorities named exactly "P1", "P2", "P3", "P4" to already
     # exist in the Jira project's priority scheme — if they don't exist
     # yet, ticket creation will fail with a 400 from Jira's API rather than
-    # silently falling back to a default. ExpiredManualReview is NOT one of
-    # the four buckets covered by this requirement — it keeps Jira's
-    # standard "Highest" priority, unchanged. These four priority NAMES are
+    # silently falling back to a default. These four priority NAMES are
     # unchanged by the bucket renumbering — only the day ranges that map to
     # each name have moved, so nothing needs to change in Jira itself.
     "P3": {"severity": "INFORMATION", "priority": "P3"},
     "P2": {"severity": "WARNING",     "priority": "P2"},
     "P1": {"severity": "CRITICAL",    "priority": "P1"},
-    "ExpiredManualReview": {"severity": "EXPIRED", "priority": "Highest"},
+    # ExpiredManualReview's priority is now the literal "P1" too, same tier
+    # as the most urgent active bucket, since an already-expired secret is
+    # at least as urgent as one about to expire. This is the ONLY change
+    # for ExpiredManualReview — severity stays "EXPIRED" (distinct wording
+    # in the ticket body/Teams text), AlertStatus stays "ExpiredManualReview"
+    # (never becomes P1 in SharePoint), and it is still never auto rotated.
+    "ExpiredManualReview": {"severity": "EXPIRED", "priority": "P1"},
 }
 
 TEAMS_HEADERS = {
@@ -418,6 +422,7 @@ async def run_secret_monitoring(
         "manualOwnersPropagated": 0,   # sibling rows backfilled with an app-wide ManualAppOwners value
         "productLookupsApplied": 0,    # NEW — ManualAppOwners set/overwritten from a ProductName lookup
         "productLookupsNotFound": 0,   # NEW — ProductName was filled in, but no matching KV secret exists
+        "lineageMatchesFound": 0,      # NEW — new secrets that matched a parent row's NewSecretKeyId
         "movedToIgnored": 0,           # abandoned secrets (-8+ days, no ticket or Canceled) moved to IgnoredSecretRegistry
         "errors": [],
     }
@@ -612,6 +617,45 @@ async def run_secret_monitoring(
         else:
             existing_secrets.append((c, existing))
 
+    # ── Lineage tracking — same secret, new version after rotation ───────────
+    # When a secret rotates, rotation creates a brand-new Entra secret (new
+    # SecretID) and records that new ID in the OLD row's NewSecretKeyId
+    # column. The team fills TeamName, ProductName, and
+    # ProductTeamkeyVaultName in BY HAND only once, the first time an app is
+    # onboarded — every year after that, when the new secret shows up here
+    # as a "new" secret with no row of its own yet, this checks whether its
+    # ID matches some EXISTING row's NewSecretKeyId. If it does, that
+    # existing row is this secret's parent, and its three team/product
+    # columns are copied onto the brand-new secret automatically, so nobody
+    # has to retype them every rotation cycle. The parent row's own
+    # NewSecretKeyId is left untouched afterward — kept as history, not
+    # cleared.
+    #
+    # This map is keyed by NewSecretKeyId (the value rotation wrote), so a
+    # brand-new secret's ID can be looked up directly against it in O(1)
+    # rather than scanning every row per new secret.
+    lineage_by_new_secret_id: dict[str, dict] = {}
+    for item in sp_data.get("items", []):
+        f = item.get("fields", {})
+        new_id = (f.get("NewSecretKeyId") or "").strip()
+        if new_id and new_id not in lineage_by_new_secret_id:
+            lineage_by_new_secret_id[new_id] = {
+                "TeamName":                f.get("TeamName", ""),
+                "ProductName":              f.get("ProductName", ""),
+                "ProductTeamkeyVaultName":  f.get("ProductTeamkeyVaultName", ""),
+            }
+
+    lineage_matches_found = 0
+    for c in new_secrets:
+        parent_fields = lineage_by_new_secret_id.get(c["secret_id"])
+        if parent_fields:
+            c["lineage_fields"] = parent_fields
+            lineage_matches_found += 1
+            print(f"[INFO] Lineage match — secret {c['secret_id']} for {c['app_name']} matches a "
+                 f"parent row's NewSecretKeyId, copying TeamName/ProductName/"
+                 f"ProductTeamkeyVaultName onto the new row")
+    summary["lineageMatchesFound"] = lineage_matches_found
+
     # ── PHASE 1: Create Jira tickets for new secrets (batched) ───────────────
     # Every bucket except P5/Ignore raises/maintains a Jira ticket now —
     # see JIRA_TICKET_BUCKETS and the module docstring FIX note.
@@ -723,9 +767,17 @@ async def run_secret_monitoring(
         # there's a real value.
         if c.get("tenant_id"):
             fields["TenantID"]   = c["tenant_id"]
-            fields["TenantName"] = c["tenant_id"]
         if jira_key:
             fields["JiraTicketCreatedDate"] = today
+
+        # If this secret's ID matched a parent row's NewSecretKeyId (see the
+        # lineage tracking step above), carry over the team/product columns
+        # so the team doesn't have to retype them on every rotation cycle.
+        lineage = c.get("lineage_fields")
+        if lineage:
+            fields["TeamName"]               = lineage["TeamName"]
+            fields["ProductName"]            = lineage["ProductName"]
+            fields["ProductTeamkeyVaultName"] = lineage["ProductTeamkeyVaultName"]
 
         teams_sent = False
         if bucket in TEAMS_ALERT_BUCKETS:
@@ -798,7 +850,6 @@ async def run_secret_monitoring(
             }
             if c.get("tenant_id"):
                 fields["TenantID"]   = c["tenant_id"]
-                fields["TenantName"] = c["tenant_id"]
             try:
                 await write_sharepoint_row(None, fields)
                 return {"error": None}
@@ -963,16 +1014,23 @@ async def _handle_existing_secret(
                 # In Progress / To Do / Blocked / Awaiting Reporter / anything
                 # else recognized-but-active — someone is engaged, or the
                 # status is simply not one of the abandonment signals. Fail
-                # safe: do not move. Mark clearly as overdue-but-active so a
-                # human reviewing SecretAlertRegistry sees both facts at once.
+                # safe: do not move. AlertStatus becomes OverdueManualReview —
+                # visible in the master list, distinct from ExpiredManualReview
+                # (which covers -1 to -7 days), never auto rotated, same as
+                # ExpiredManualReview, since a human already has an open
+                # ticket on this and automated rotation risks colliding with
+                # whatever they're already doing manually. A human decides
+                # from here, not the runbook.
                 should_move = False
 
         if not should_move:
             await write_sharepoint_row(item_id, {
-                "LastChecked":  today,
-                "ExpiryNotice": (f"OVERDUE {abs(c['days'])} days — ticket "
-                                f"{jira_key or '(none)'} still "
-                                f"'{jira_status_for_note}', not auto-ignored"),
+                "LastChecked":   today,
+                "AlertStatus":   "OverdueManualReview",
+                "ExpiryNotice":  (f"OVERDUE {abs(c['days'])} days — ticket "
+                                 f"{jira_key or '(none)'} still "
+                                 f"'{jira_status_for_note}', not auto-ignored, "
+                                 f"not auto-rotated, human review required"),
             })
             result["sp_updated"] = True
             return result
@@ -985,7 +1043,6 @@ async def _handle_existing_secret(
             "ExpirationDate":    c["expiration"],
             "DaysExpired":       abs(c["days"]),
             "TenantID":          c.get("tenant_id", ""),
-            "TenantName":        c.get("tenant_id", ""),
             "LoggedDate":        today,
             "IgnoreReason":      f"Expired8Plus — {move_reason}",
         }
