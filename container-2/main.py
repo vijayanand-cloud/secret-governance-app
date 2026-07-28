@@ -342,16 +342,15 @@ async def get_sharepoint_state() -> dict:
 async def write_sharepoint_row(item_id: str | None, fields: dict[str, str]) -> dict:
     for col in {"LastChecked", "AlertSentDate", "RotationDetectedDate", "ExpirationDate", "JiraTicketCreatedDate"}:
         if col in fields and fields[col]: fields[col] = str(fields[col])[:10]
-    # CHANGED: only default TenantID/TenantName to the home tenant if the
-    # caller hasn't already set them. decision_engine.py now stamps the
-    # ACTUAL tenant a given app was scanned from (see _build_candidates'
-    # tenant_id field) — unconditionally overwriting here would silently
-    # discard that and mislabel every row as the home tenant, defeating the
-    # whole point of multi-tenant scanning.
+    # CHANGED: only default TenantID to the home tenant if the caller hasn't
+    # already set it. decision_engine.py now stamps the ACTUAL tenant a
+    # given app was scanned from (see _build_candidates' tenant_id field) —
+    # unconditionally overwriting here would silently discard that and
+    # mislabel every row as the home tenant, defeating the whole point of
+    # multi-tenant scanning. (TenantName was removed — the column no longer
+    # exists in SharePoint.)
     if not fields.get("TenantID"):
         fields["TenantID"] = GRAPH_TENANT_ID
-    if not fields.get("TenantName"):
-        fields["TenantName"] = await get_tenant_name()
     headers = {"Authorization": f"Bearer {await _sp_graph_token()}", "Content-Type": "application/json"}
     base = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{SHAREPOINT_LIST_ID}/items"
     async with httpx.AsyncClient() as c:
@@ -390,7 +389,7 @@ async def move_secret_to_ignored(item_id: str, fields: dict[str, str], reason: s
 
     fields should already be shaped to match IgnoredSecretRegistry's own
     schema (Title, AppName, SecretID, SecretDescription, ExpirationDate,
-    DaysExpired, TenantID, TenantName, LoggedDate, IgnoreReason) — see
+    DaysExpired, TenantID, LoggedDate, IgnoreReason) — see
     decision_engine.py's caller for how these are built.
 
     If SHAREPOINT_IGNORED_LIST_ID isn't configured, this is a no-op that
@@ -406,8 +405,6 @@ async def move_secret_to_ignored(item_id: str, fields: dict[str, str], reason: s
     fields = dict(fields)
     if not fields.get("TenantID"):
         fields["TenantID"] = GRAPH_TENANT_ID
-    if not fields.get("TenantName"):
-        fields["TenantName"] = await get_tenant_name()
 
     async with httpx.AsyncClient() as c:
         try:
