@@ -339,9 +339,58 @@ async def get_sharepoint_state() -> dict:
             url = b.get("@odata.nextLink")
     return {"items": items, "count": len(items)}
 
+async def get_sharepoint_rows_by_jira_key(jira_key: str) -> dict:
+    """
+    Targeted alternative to get_sharepoint_state() for callers that only
+    need the row(s) matching one specific JiraTicketKey — currently just
+    /tools/jira-status-update.
+
+    get_sharepoint_state() fetches and paginates through EVERY row in the
+    list, which is fine for callers that genuinely need the whole thing
+    (monitoring, the general-purpose /tools/get_sharepoint_state endpoint),
+    but is the wrong tool here: at list sizes in the low thousands, that
+    full scan can take longer than Jira's own 30s "Send web request"
+    timeout, so a Jira automation rule sees "timed out, result unknown"
+    even when the underlying update eventually succeeds. Filtering
+    server-side via Graph's $filter means the response time no longer
+    depends on total list size at all.
+
+    JiraTicketKey is not necessarily an indexed column — on lists past the
+    5000-item view threshold this would need the
+    "Prefer: HonorNonIndexedQueriesWarningMayFailRandomly" header or an
+    actual index on the column. Below that threshold (current list size),
+    a plain $filter works without either.
+    """
+    headers = {"Authorization": f"Bearer {await _sp_graph_token()}"}
+    safe_key = jira_key.replace("'", "''")  # OData literal escaping
+    url = (
+        f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
+        f"/lists/{SHAREPOINT_LIST_ID}/items"
+        f"?$expand=fields&$filter=fields/JiraTicketKey eq '{safe_key}'"
+    )
+    items = []
+    async with httpx.AsyncClient() as c:
+        while url:
+            r = await c.get(url, headers=headers, timeout=30)
+            if not r.is_success:
+                log.error("get_sharepoint_rows_by_jira_key Graph error [%s] for %s: %s",
+                          r.status_code, url, r.text[:2000])
+            r.raise_for_status()
+            b = r.json()
+            items.extend(b.get("value", []))
+            url = b.get("@odata.nextLink")
+    return {"items": items, "count": len(items)}
+
 async def write_sharepoint_row(item_id: str | None, fields: dict[str, str]) -> dict:
-    for col in {"LastChecked", "AlertSentDate", "RotationDetectedDate", "ExpirationDate", "JiraTicketCreatedDate"}:
-        if col in fields and fields[col]: fields[col] = str(fields[col])[:10]
+    # FIX: no more 10-char truncation here. LastChecked, AlertSentDate,
+    # RotationDetectedDate, and JiraTicketCreatedDate now arrive as full EST
+    # timestamps from decision_engine.py's _now_est_string() (matching
+    # runbook_discovery.py's format exactly), and ExpirationDate now arrives
+    # pre-formatted via _format_datetime_est() instead of a raw Entra ISO
+    # string. Slicing any of these to 10 characters would destroy the time
+    # portion right back down to a bare date, undoing that fix at the last
+    # possible step. Nothing passed into this function needs date-only
+    # truncation anymore.
     # CHANGED: only default TenantID to the home tenant if the caller hasn't
     # already set it. decision_engine.py now stamps the ACTUAL tenant a
     # given app was scanned from (see _build_candidates' tenant_id field) —
@@ -627,6 +676,14 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
     rule setup below — it must watch ALL SIX destination statuses, not a
     subset, for this endpoint to ever be called on every real transition.
 
+    FIX (this version): switched from get_sharepoint_state() (fetches and
+    paginates through the ENTIRE list) to get_sharepoint_rows_by_jira_key()
+    (server-side $filter for just the matching row). At list sizes in the
+    low thousands, the old full-list fetch could take longer in total than
+    Jira's own 30s "Send web request" timeout — Jira would report "timed
+    out, result unknown" even when the update eventually succeeded
+    server-side. Response time no longer depends on total list size.
+
     Jira automation rule setup (Project Settings → Automation → new rule):
       Trigger : Work item transitioned
         To status : TO DO, IN PROGRESS, DONE, CANCELED, BLOCKED,
@@ -640,8 +697,12 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
         Body   : {
                    "jira_key":  "{{issue.key}}",
                    "to_status": "{{destinationStatus.name}}",
-                   "today":     "{{now.format('yyyy-MM-dd')}}"
+                   "today":     "{{now.jiraDate}}"
                  }
+        NOTE: {{now.format('yyyy-MM-dd')}} (single-quoted arg) fails to
+        render in some Jira environments with "Unable to render smart
+        values" and silently kills the whole request before it's ever
+        sent — {{now.jiraDate}} is the confirmed-working equivalent.
 
     SharePoint AlertStatus mapping:
       Done                                        → Rotated
@@ -657,7 +718,7 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
     and no-ops rather than guessing, which is the correct behavior for a
     status this endpoint has never been told about.
     """
-    sp_data   = await get_sharepoint_state()
+    sp_data   = await get_sharepoint_rows_by_jira_key(req.jira_key)
     today     = req.today
     updated   = 0
     status    = req.to_status.strip().lower()
