@@ -726,7 +726,7 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
     # Determine what AlertStatus to set based on Jira transition. Matched
     # against the client's ACTUAL 6-status "Incident workflow" (see the
     # module docstring for the workflow diagram this was verified against).
-    DONE_STATUSES        = {"done"}
+    DONE_STATUSES        = {"done","resolved"}
     CANCELED_STATUSES     = {"canceled", "cancelled"}   # accept both spellings
     REOPEN_STATUSES       = {"in progress", "to do", "reopened", "open"}
     BLOCKED_STATUSES      = {"blocked"}
