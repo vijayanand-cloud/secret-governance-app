@@ -345,41 +345,42 @@ async def get_sharepoint_rows_by_jira_key(jira_key: str) -> dict:
     need the row(s) matching one specific JiraTicketKey — currently just
     /tools/jira-status-update.
 
-    get_sharepoint_state() fetches and paginates through EVERY row in the
-    list, which is fine for callers that genuinely need the whole thing
-    (monitoring, the general-purpose /tools/get_sharepoint_state endpoint),
-    but is the wrong tool here: at list sizes in the low thousands, that
-    full scan can take longer than Jira's own 30s "Send web request"
-    timeout, so a Jira automation rule sees "timed out, result unknown"
-    even when the underlying update eventually succeeds. Filtering
-    server-side via Graph's $filter means the response time no longer
-    depends on total list size at all.
-
-    JiraTicketKey is not necessarily an indexed column — on lists past the
-    5000-item view threshold this would need the
-    "Prefer: HonorNonIndexedQueriesWarningMayFailRandomly" header or an
-    actual index on the column. Below that threshold (current list size),
-    a plain $filter works without either.
+    Tries a server-side $filter first (fast, doesn't scale with list size).
+    If Graph rejects it (400 — most likely because JiraTicketKey isn't an
+    indexed column), falls back to the full-list scan get_sharepoint_state()
+    already does, filtered client-side. Slower in the fallback case, but
+    never hard-fails the whole request just because filtering isn't
+    supported — correctness over speed when the fast path isn't available.
     """
-    headers = {"Authorization": f"Bearer {await _sp_graph_token()}"}
+    headers = {
+        "Authorization": f"Bearer {await _sp_graph_token()}",
+        "Prefer": "HonorNonIndexedQueriesWarningMayFailRandomly",
+    }
     safe_key = jira_key.replace("'", "''")  # OData literal escaping
     url = (
         f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}"
         f"/lists/{SHAREPOINT_LIST_ID}/items"
         f"?$expand=fields&$filter=fields/JiraTicketKey eq '{safe_key}'"
     )
-    items = []
-    async with httpx.AsyncClient() as c:
-        while url:
-            r = await c.get(url, headers=headers, timeout=30)
-            if not r.is_success:
-                log.error("get_sharepoint_rows_by_jira_key Graph error [%s] for %s: %s",
-                          r.status_code, url, r.text[:2000])
-            r.raise_for_status()
-            b = r.json()
-            items.extend(b.get("value", []))
-            url = b.get("@odata.nextLink")
-    return {"items": items, "count": len(items)}
+    try:
+        items = []
+        async with httpx.AsyncClient() as c:
+            while url:
+                r = await c.get(url, headers=headers, timeout=30)
+                r.raise_for_status()
+                b = r.json()
+                items.extend(b.get("value", []))
+                url = b.get("@odata.nextLink")
+        return {"items": items, "count": len(items)}
+    except httpx.HTTPStatusError as e:
+        log.warning("get_sharepoint_rows_by_jira_key: filtered query failed (%s) — "
+                    "falling back to full-list scan for jira_key=%s. Consider "
+                    "indexing the JiraTicketKey column in SharePoint to make "
+                    "the fast path work.", e, jira_key)
+        full = await get_sharepoint_state()
+        matched = [item for item in full.get("items", [])
+                   if item.get("fields", {}).get("JiraTicketKey") == jira_key]
+        return {"items": matched, "count": len(matched)}
 
 async def write_sharepoint_row(item_id: str | None, fields: dict[str, str]) -> dict:
     # FIX: no more 10-char truncation here. LastChecked, AlertSentDate,
