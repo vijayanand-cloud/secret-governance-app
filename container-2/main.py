@@ -472,6 +472,91 @@ async def create_ignored_row(fields: dict[str, str]) -> dict:
 
     return {"success": True, "item_id": r.json().get("id")}
 
+async def get_ignored_sharepoint_state() -> dict:
+    """
+    NEW - mirrors get_sharepoint_state() but reads IgnoredSecretRegistry
+    instead of the master list. Needed so /tools/jira-status-update can look
+    a ticket up in IgnoredSecretRegistry when it isn't found in the master
+    list - i.e. the secret was already moved to Ignored (ticket canceled, or
+    the -8-day abandonment check), and the ticket has now been reopened.
+
+    Returns an empty result (not an error) if SHAREPOINT_IGNORED_LIST_ID
+    isn't configured.
+    """
+    if not SHAREPOINT_IGNORED_LIST_ID:
+        return {"items": [], "count": 0}
+
+    headers = {"Authorization": f"Bearer {await _sp_graph_token()}"}
+    url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{SHAREPOINT_IGNORED_LIST_ID}/items?$expand=fields"
+    items = []
+    async with httpx.AsyncClient() as c:
+        while url:
+            r = await c.get(url, headers=headers, timeout=30)
+            if not r.is_success:
+                log.error("get_ignored_sharepoint_state Graph error [%s] for %s: %s",
+                          r.status_code, url, r.text[:2000])
+            r.raise_for_status()
+            b = r.json()
+            items.extend(b.get("value", []))
+            url = b.get("@odata.nextLink")
+    return {"items": items, "count": len(items)}
+
+def _days_expired_from_expiration(expiration_str: str) -> int:
+    """Best-effort parse of the EST-formatted ExpirationDate string back into
+    a days-expired count, for rebuilding IgnoredSecretRegistry's DaysExpired
+    field when moving a row there. Falls back to 0 on any parse failure -
+    this is informational only, never blocks the actual move."""
+    try:
+        exp = datetime.strptime(expiration_str, "%Y-%m-%d %I:%M:%S %p")
+        return abs((datetime.now() - exp).days)
+    except Exception:
+        return 0
+
+async def move_secret_from_ignored(item_id: str, fields: dict[str, str], reason: str) -> dict:
+    """
+    NEW - the reverse of move_secret_to_ignored: moves one row OUT of
+    IgnoredSecretRegistry and back INTO the master SecretAlertRegistry list,
+    for when a ticket that was Canceled (and moved to Ignored) gets reopened
+    (To Do / In Progress / etc.) in Jira.
+
+    Same safety ordering as move_secret_to_ignored: create in the master
+    list FIRST, then delete from IgnoredSecretRegistry - a failure partway
+    through leaves the row duplicated (visible, safe to fix by hand) rather
+    than the row vanishing from both lists entirely.
+
+    fields should already be shaped to match the master list's schema
+    (Title, AppName, SecretID, SecretDescription, ExpirationDate,
+    AlertStatus, ExpiryNotice, LastChecked, JiraTicketKey, TenantID).
+    """
+    headers = {"Authorization": f"Bearer {await _sp_graph_token()}", "Content-Type": "application/json"}
+    master_base = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{SHAREPOINT_LIST_ID}/items"
+
+    fields = dict(fields)
+    if not fields.get("TenantID"):
+        fields["TenantID"] = GRAPH_TENANT_ID
+
+    async with httpx.AsyncClient() as c:
+        try:
+            create_resp = await c.post(master_base, headers=headers, content=json.dumps({"fields": fields}), timeout=20)
+            create_resp.raise_for_status()
+        except Exception as e:
+            return {"success": False, "error": f"create in master list failed: {e}"}
+
+    ignored_delete_url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{SHAREPOINT_IGNORED_LIST_ID}/items/{item_id}"
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.delete(ignored_delete_url, headers=headers, timeout=20)
+            if r.status_code not in (204, 404):
+                r.raise_for_status()
+    except Exception as e:
+        log.error("move_secret_from_ignored: created in master list but FAILED to "
+                  "delete original IgnoredSecretRegistry row %s — row now exists in BOTH "
+                  "lists, needs manual cleanup: %s", item_id, e)
+        return {"success": True, "warning": f"row exists in both lists — delete of {item_id} failed: {e}"}
+
+    log.info("move_secret_from_ignored: moved item %s back to master list (%s)", item_id, reason)
+    return {"success": True}
+
 async def create_jira_ticket(app_name: str, app_id: str, secret_id: str, secret_description: str, expiration_date: str, days_remaining: int, severity: str = "WARNING", priority: str = "High", extra_note: str = "") -> dict:
     days_text = f"EXPIRED {abs(days_remaining)} days ago" if days_remaining < 0 else f"{days_remaining} days remaining"
     summary_line = f"[{severity}] Azure Secret Expiry - {app_name} - {days_text}"
@@ -676,41 +761,68 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
     rule setup below — it must watch ALL SIX destination statuses, not a
     subset, for this endpoint to ever be called on every real transition.
  
-    Jira automation rule setup (Project Settings → Automation → new rule):
+    Jira automation rule setup (Project Settings -> Automation -> new rule):
       Trigger : Work item transitioned
         To status : TO DO, IN PROGRESS, DONE, CANCELED, BLOCKED,
                      AWAITING REPORTER: NEEDS MORE INFORMATION
-                     (ALL SIX — do not scope this down to a subset, or
+                     (ALL SIX - do not scope this down to a subset, or
                      transitions into an unwatched status will silently
                      never call this endpoint at all)
       Action  : Send web request
         Method : POST
-        URL    : https://<container-2-fqdn>/tools/jira-status-update
+        URL    : https://<container-1-fqdn>/jira-status-update
+                 (Container 1's proxy route - see that file's docstring for
+                 why this goes through Container 1 rather than straight to
+                 this endpoint: ingress only exposes one port at a time, and
+                 Container 1's port is the one that also needs to stay
+                 reachable for the scheduled /run trigger)
         Body   : {
                    "jira_key":  "{{issue.key}}",
                    "to_status": "{{destinationStatus.name}}",
-                   "today":     "{{now.format('yyyy-MM-dd')}}"
+                   "today":     "{{now.jiraDate}}"
                  }
- 
+        NOTE: {{now.format('yyyy-MM-dd')}} (single-quoted arg) has been seen
+        to fail with "Unable to render smart values" in some Jira
+        environments, which silently kills the whole request before it's
+        ever sent - {{now.jiraDate}} is the confirmed-working equivalent.
+
     SharePoint AlertStatus mapping:
-      Done                                        → Rotated
-      Canceled                                     → Ignored (secret no longer being tracked)
-      In Progress / To Do                          → JiraRaised (reopened — monitoring resumes)
-      Blocked                                      → Blocked (visible in SharePoint, distinct from JiraRaised)
-      Awaiting Reporter: Needs more information     → AwaitingReporter (visible in SharePoint,
+      Done                                        -> Rotated
+      Canceled                                     -> row MOVED to IgnoredSecretRegistry (see below)
+      In Progress / To Do                          -> JiraRaised (reopened - monitoring resumes)
+      Blocked                                      -> Blocked (visible in SharePoint, distinct from JiraRaised)
+      Awaiting Reporter: Needs more information     -> AwaitingReporter (visible in SharePoint,
                                                        distinct from Blocked)
-    Every one of the six real statuses now maps to SOMETHING — there is no
+    Every one of the six real statuses now maps to SOMETHING - there is no
     remaining "falls through, does nothing" case for a status that's part
     of the actual configured workflow. An entirely unrecognized status name
     (a future workflow change, a typo in the automation rule) still logs
     and no-ops rather than guessing, which is the correct behavior for a
     status this endpoint has never been told about.
+
+    FIX (this version) - TWO-WAY sync with IgnoredSecretRegistry:
+    Previously "Canceled" just set AlertStatus="Ignored" on the row IN
+    PLACE in the master list. Since "Ignored" is a terminal status,
+    monitoring would then skip that row forever - it never actually moved
+    to IgnoredSecretRegistry the way the -8-day abandonment check does for
+    the same conceptual outcome. Now:
+      - Canceled  -> the row is physically MOVED to IgnoredSecretRegistry
+        (create there, delete from the master list), same move_secret_to_
+        ignored() function the abandonment check already uses.
+      - Any other status, when the ticket ISN'T found in the master list ->
+        IgnoredSecretRegistry is checked too. If found there, the row is
+        moved BACK to the master list with the appropriate AlertStatus,
+        since a non-Canceled transition means the ticket is active again.
+    This requires a JiraTicketKey column on IgnoredSecretRegistry (added
+    for this - see decision_engine.py's Ignore-branch, which now also
+    stamps it). Rows moved to IgnoredSecretRegistry BEFORE this column
+    existed have no JiraTicketKey recorded and can't be found by the
+    reverse lookup even if their ticket is later reopened - only rows
+    ignored from this point forward are covered.
     """
-    sp_data   = await get_sharepoint_state()
-    today     = req.today
-    updated   = 0
-    status    = req.to_status.strip().lower()
- 
+    today  = req.today
+    status = req.to_status.strip().lower()
+
     # Determine what AlertStatus to set based on Jira transition. Matched
     # against the client's ACTUAL 6-status "Incident workflow" (see the
     # module docstring for the workflow diagram this was verified against).
@@ -722,18 +834,18 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
         "awaiting reporter: needs more information",
         "awaiting reporter",   # in case Jira truncates/aliases the full name
     }
- 
+
     if status in DONE_STATUSES:
         new_alert_status  = "Rotated"
-        new_expiry_notice = "Rotated — Completed"
+        new_expiry_notice = "Rotated - Completed"
         extra_fields      = {"RotationDetectedDate": today}
     elif status in CANCELED_STATUSES:
         new_alert_status  = "Ignored"
-        new_expiry_notice = f"Jira ticket {req.jira_key} canceled — no longer tracked"
+        new_expiry_notice = f"Jira ticket {req.jira_key} canceled - no longer tracked"
         extra_fields      = {}
     elif status in REOPEN_STATUSES:
         new_alert_status  = "JiraRaised"
-        new_expiry_notice = f"Jira ticket {req.jira_key} reopened — monitoring resumed"
+        new_expiry_notice = f"Jira ticket {req.jira_key} reopened - monitoring resumed"
         extra_fields      = {}
     elif status in BLOCKED_STATUSES:
         new_alert_status  = "Blocked"
@@ -741,39 +853,105 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
         extra_fields      = {}
     elif status in AWAITING_STATUSES:
         new_alert_status  = "AwaitingReporter"
-        new_expiry_notice = f"Jira ticket {req.jira_key} awaiting reporter — needs more information"
+        new_expiry_notice = f"Jira ticket {req.jira_key} awaiting reporter - needs more information"
         extra_fields      = {}
     else:
-        log.info("jira-status-update: unhandled status '%s' for %s — no SP update "
-                 "(this status is not part of the 6 recognized workflow states — "
+        log.info("jira-status-update: unhandled status '%s' for %s - no SP update "
+                 "(this status is not part of the 6 recognized workflow states - "
                  "check for a typo in the Jira automation rule, or a workflow change "
                  "this endpoint hasn't been updated for)",
                  req.to_status, req.jira_key)
         return {"updated": 0, "jira_key": req.jira_key,
-                "note": f"Status '{req.to_status}' not mapped — no action taken"}
- 
-    # Find and update matching SP rows
-    for item in sp_data.get("items", []):
-        f = item.get("fields", {})
-        if f.get("JiraTicketKey") == req.jira_key:
-            fields = {
-                "AlertStatus":  new_alert_status,
-                "ExpiryNotice": new_expiry_notice,
-                "LastChecked":  today,
+                "note": f"Status '{req.to_status}' not mapped - no action taken"}
+
+    # -- Step 1: search the master list first, same as before -----------------
+    sp_data = await get_sharepoint_state()
+    master_matches = [item for item in sp_data.get("items", [])
+                       if item.get("fields", {}).get("JiraTicketKey") == req.jira_key]
+
+    updated  = 0
+    moved_to_ignored   = 0
+    moved_from_ignored = 0
+
+    if master_matches:
+        for item in master_matches:
+            f = item.get("fields", {})
+            if status in CANCELED_STATUSES:
+                # Physically move to IgnoredSecretRegistry instead of just
+                # tagging AlertStatus="Ignored" in place - see the FIX note
+                # in the docstring above for why.
+                ignored_fields = {
+                    "Title":             f.get("Title", ""),
+                    "AppName":           f.get("AppName", ""),
+                    "SecretID":          f.get("SecretID", ""),
+                    "SecretDescription": f.get("SecretDescription", ""),
+                    "ExpirationDate":    f.get("ExpirationDate", ""),
+                    "DaysExpired":       _days_expired_from_expiration(f.get("ExpirationDate", "")),
+                    "TenantID":          f.get("TenantID", ""),
+                    "LoggedDate":        today,
+                    "IgnoreReason":      f"Jira ticket {req.jira_key} canceled",
+                    "JiraTicketKey":     req.jira_key,
+                }
+                move_result = await move_secret_to_ignored(
+                    item["id"], ignored_fields, f"Jira ticket {req.jira_key} canceled")
+                if move_result.get("success"):
+                    updated += 1
+                    moved_to_ignored += 1
+                    log.info("jira-status-update: item=%s jira=%s -> moved to IgnoredSecretRegistry",
+                             item["id"], req.jira_key)
+            else:
+                fields = {
+                    "AlertStatus":  new_alert_status,
+                    "ExpiryNotice": new_expiry_notice,
+                    "LastChecked":  today,
+                    **extra_fields,
+                }
+                await write_sharepoint_row(item["id"], fields)
+                updated += 1
+                log.info("jira-status-update: item=%s jira=%s -> AlertStatus=%s",
+                         item["id"], req.jira_key, new_alert_status)
+
+    # -- Step 2: not found in the master list, and not a Canceled transition -
+    #            check IgnoredSecretRegistry too, in case this ticket was
+    #            previously canceled (moved there) and is now reopened. -----
+    elif status not in CANCELED_STATUSES:
+        ignored_data = await get_ignored_sharepoint_state()
+        ignored_matches = [item for item in ignored_data.get("items", [])
+                            if item.get("fields", {}).get("JiraTicketKey") == req.jira_key]
+        for item in ignored_matches:
+            f = item.get("fields", {})
+            master_fields = {
+                "Title":             f.get("Title", ""),
+                "AppName":           f.get("AppName", ""),
+                "SecretID":          f.get("SecretID", ""),
+                "SecretDescription": f.get("SecretDescription", ""),
+                "ExpirationDate":    f.get("ExpirationDate", ""),
+                "TenantID":          f.get("TenantID", ""),
+                "JiraTicketKey":     req.jira_key,
+                "AlertStatus":       new_alert_status,
+                "ExpiryNotice":      new_expiry_notice,
+                "LastChecked":       today,
                 **extra_fields,
             }
-            await write_sharepoint_row(item["id"], fields)
-            updated += 1
-            log.info("jira-status-update: item=%s jira=%s → AlertStatus=%s",
-                     item["id"], req.jira_key, new_alert_status)
- 
-    log.info("jira-status-update: %s rows updated for %s (→ %s)",
-             updated, req.jira_key, new_alert_status)
+            move_result = await move_secret_from_ignored(
+                item["id"], master_fields,
+                f"Jira ticket {req.jira_key} reopened ({req.to_status})")
+            if move_result.get("success"):
+                updated += 1
+                moved_from_ignored += 1
+                log.info("jira-status-update: item=%s jira=%s -> moved back to master list, AlertStatus=%s",
+                         item["id"], req.jira_key, new_alert_status)
+
+    log.info("jira-status-update: %s row(s) updated for %s (-> %s) "
+             "[movedToIgnored=%s, movedFromIgnored=%s]",
+             updated, req.jira_key, new_alert_status, moved_to_ignored, moved_from_ignored)
     return {
-        "updated":      updated,
-        "jira_key":     req.jira_key,
-        "to_status":    req.to_status,
-        "alert_status": new_alert_status,
+        "updated":           updated,
+        "jira_key":          req.jira_key,
+        "to_status":         req.to_status,
+        "alert_status":      new_alert_status,
+        "movedToIgnored":    moved_to_ignored,
+        "movedFromIgnored":  moved_from_ignored,
     }
  
 # Keep old endpoints for backwards compatibility

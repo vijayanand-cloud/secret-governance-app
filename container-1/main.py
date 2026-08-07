@@ -2,11 +2,14 @@
 Azure Secret Governance - LangChain Agent  (Container 1)
 =========================================================
 Endpoints:
-  GET  /health          - liveness probe
-  POST /run             - trigger a governance cycle (background task - returns immediately)
-  POST /chat            - conversational endpoint with per-session memory
-  POST /jira-webhook    - Jira automation trigger when ticket is resolved
-  POST /teams-webhook   - Microsoft Teams Bot Service messages
+  GET  /health              - liveness probe
+  POST /run                 - trigger a governance cycle (background task - returns immediately)
+  POST /chat                - conversational endpoint with per-session memory
+  POST /jira-status-update  - NEW: plain proxy to Container 2's /tools/jira-status-update,
+                               added so the Jira automation rule has a stable externally-reachable
+                               URL regardless of which port ingress currently points at (see the
+                               endpoint's own docstring for the full reasoning)
+  POST /teams-webhook       - Microsoft Teams Bot Service messages
  
 REMOVED in this version:
   POST /jira-webhook - retired. This endpoint only ever recognized 3 status
@@ -304,6 +307,11 @@ class RunRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     session_id: str = "default_user_session"
+
+class JiraStatusUpdateReq(BaseModel):
+    jira_key:  str
+    to_status: str
+    today:     str
  
 # ── Endpoints ─────────────────────────────────────────────────────────────────
  
@@ -343,7 +351,30 @@ async def chat(req: ChatRequest):
         log.exception("Chat request failed for session %s", req.session_id)
         raise HTTPException(status_code=500, detail=str(e))
  
+@app.post("/jira-status-update")
+async def jira_status_update_proxy(req: JiraStatusUpdateReq):
+    """
+    NEW - plain pass-through proxy to Container 2's /tools/jira-status-update,
+    added specifically because a Container App only exposes ONE external
+    port at a time. Container 2's own /tools/* routes (port 8001) aren't
+    reachable externally whenever ingress is pointed at Container 1 (port
+    8000, needed for /run to work for the scheduled monitoring trigger).
+    Rather than fight over which port ingress points at, point the Jira
+    automation rule at THIS endpoint instead - same request body as before,
+    just a different external host. Container 1 forwards it internally to
+    Container 2 via the same localhost:8001 call every other tool here
+    already uses (_call_monitor), so ingress can stay on 8000 permanently.
+
+    No logic lives here - Container 2's /tools/jira-status-update remains
+    the single source of truth for the six-status mapping and the
+    master-list <-> IgnoredSecretRegistry move logic. This route only
+    exists to make it reachable from outside the Container App.
+    """
+    return await _call_monitor("jira-status-update", req.dict())
+
 # NOTE: /jira-webhook and _update_sharepoint_on_close() were REMOVED here -
 # see the module docstring at the top of this file for why. Jira automation
-# now calls Container 2's /tools/jira-status-update directly; Container 1 is
-# no longer part of the Jira→SharePoint sync path at all.
+# now calls Container 2's /tools/jira-status-update directly (via the
+# /jira-status-update proxy above); the retired /jira-webhook endpoint's old
+# 3-status logic is not reused here.
+ 

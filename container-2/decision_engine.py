@@ -1234,6 +1234,13 @@ async def _handle_existing_secret(
             "TenantID":          c.get("tenant_id", ""),
             "LoggedDate":        today,
             "IgnoreReason":      f"Expired8Plus - {move_reason}",
+            # NEW - preserves the ticket link so the jira-status-update
+            # webhook can find this row again in IgnoredSecretRegistry if
+            # the ticket is later reopened. Requires a JiraTicketKey column
+            # to exist on IgnoredSecretRegistry - blank if this row never
+            # had a ticket to begin with (the "no ticket at all" abandonment
+            # case), which is correct, there's nothing to look up for those.
+            "JiraTicketKey":     jira_key,
         }
         move_result = await move_secret_to_ignored(item_id, ignored_fields, move_reason)
         if move_result.get("success"):
