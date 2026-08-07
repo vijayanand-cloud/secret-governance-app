@@ -738,7 +738,14 @@ class JiraStatusUpdateReq(BaseModel):
     jira_key:  str
     to_status: str   # Jira destination status name, exact text from the workflow
     today:     str
- 
+    # Populated from the Jira issue's TeamName/ProductName/DevSecOpsOwnership
+    # custom fields (see automation rule body below). Only used to backfill
+    # the matching SharePoint row on a Resolved transition, and only when
+    # that row's own column is empty — never overwrites an existing value.
+    team_name:           Optional[str] = None
+    product_name:        Optional[str] = None
+    devsecops_ownership: Optional[str] = None
+
 @app.post("/tools/jira-status-update")
 async def api_jira_status_update(req: JiraStatusUpdateReq):
     """
@@ -777,14 +784,22 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
                  Container 1's port is the one that also needs to stay
                  reachable for the scheduled /run trigger)
         Body   : {
-                   "jira_key":  "{{issue.key}}",
-                   "to_status": "{{destinationStatus.name}}",
-                   "today":     "{{now.jiraDate}}"
+                   "jira_key":            "{{issue.key}}",
+                   "to_status":           "{{destinationStatus.name}}",
+                   "today":               "{{now.jiraDate}}",
+                   "team_name":           "{{issue.customfield_10113}}",
+                   "product_name":        "{{issue.customfield_10110}}",
+                   "devsecops_ownership": "{{issue.customfield_10112}}"
                  }
         NOTE: {{now.format('yyyy-MM-dd')}} (single-quoted arg) has been seen
         to fail with "Unable to render smart values" in some Jira
         environments, which silently kills the whole request before it's
         ever sent - {{now.jiraDate}} is the confirmed-working equivalent.
+        NOTE: customfield_10110/10112/10113 are KAN project field IDs
+        (ProductName/DevSecOpsOwnership/TeamName respectively) - these are
+        only sent so a Resolved transition can backfill an empty SharePoint
+        row; they're harmless no-ops on every other transition since the
+        backfill logic only reads them when status is Done/Resolved.
 
     SharePoint AlertStatus mapping:
       Done                                        -> Rotated
@@ -826,13 +841,19 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
     # Determine what AlertStatus to set based on Jira transition. Matched
     # against the client's ACTUAL 6-status "Incident workflow" (see the
     # module docstring for the workflow diagram this was verified against).
-    DONE_STATUSES        = {"done"}
+    DONE_STATUSES        = {"done", "resolved"}   # "resolved" added — the live KAN
+                                                    # Incident workflow's actual terminal
+                                                    # status is "Resolved", not "Done"
     CANCELED_STATUSES     = {"canceled", "cancelled"}   # accept both spellings
     REOPEN_STATUSES       = {"in progress", "to do", "reopened", "open"}
     BLOCKED_STATUSES      = {"blocked"}
     AWAITING_STATUSES     = {
         "awaiting reporter: needs more information",
         "awaiting reporter",   # in case Jira truncates/aliases the full name
+        "waiting for customer",  # KAN project's actual live status name for
+                                  # this same "waiting on reporter/customer
+                                  # for info" concept — different wording,
+                                  # same AlertStatus outcome
     }
 
     if status in DONE_STATUSES:
@@ -906,6 +927,20 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
                     "LastChecked":  today,
                     **extra_fields,
                 }
+                if status in DONE_STATUSES:
+                    # Backfill only — never overwrites a value someone already
+                    # set in SharePoint. req.team_name/product_name/
+                    # devsecops_ownership come from the Jira issue's own
+                    # required-on-Resolve fields, so by the time this fires
+                    # they're guaranteed non-empty on the Jira side; this just
+                    # closes the gap when the SharePoint row itself was never
+                    # populated.
+                    if not f.get("TeamName") and req.team_name:
+                        fields["TeamName"] = req.team_name
+                    if not f.get("ProductName") and req.product_name:
+                        fields["ProductName"] = req.product_name
+                    if not f.get("DevSecOpsOwnership") and req.devsecops_ownership:
+                        fields["DevSecOpsOwnership"] = req.devsecops_ownership
                 await write_sharepoint_row(item["id"], fields)
                 updated += 1
                 log.info("jira-status-update: item=%s jira=%s -> AlertStatus=%s",
