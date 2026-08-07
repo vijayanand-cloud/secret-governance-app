@@ -433,6 +433,45 @@ async def move_secret_to_ignored(item_id: str, fields: dict[str, str], reason: s
     log.info("move_secret_to_ignored: moved item %s to IgnoredSecretRegistry (%s)", item_id, reason)
     return {"success": True}
  
+async def create_ignored_row(fields: dict[str, str]) -> dict:
+    """
+    NEW - creates a fresh row directly in IgnoredSecretRegistry, for a secret
+    that's brand new to monitoring AND already 8+ days expired. Unlike
+    move_secret_to_ignored, there is no delete step here - the secret never
+    had a SecretAlertRegistry row to begin with, so there's nothing to move
+    it away from. This matches how runbook_discovery.py has always handled a
+    freshly-discovered Ignore-bucket secret: straight into IgnoredSecretRegistry,
+    never via the master list first.
+
+    fields should already be shaped to match IgnoredSecretRegistry's own
+    schema (Title, AppName, SecretID, SecretDescription, ExpirationDate,
+    DaysExpired, TenantID, LoggedDate, IgnoreReason) - same shape
+    move_secret_to_ignored expects.
+
+    If SHAREPOINT_IGNORED_LIST_ID isn't configured, this is a no-op that
+    returns success=False rather than raising - the caller decides what to
+    do (typically: fall back to writing a plain Discovered row in the master
+    list instead, so the secret is still tracked somewhere).
+    """
+    if not SHAREPOINT_IGNORED_LIST_ID:
+        return {"success": False, "error": "SHAREPOINT-IGNORED-LIST-ID not configured"}
+
+    headers = {"Authorization": f"Bearer {await _sp_graph_token()}", "Content-Type": "application/json"}
+    ignored_base = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{SHAREPOINT_IGNORED_LIST_ID}/items"
+
+    fields = dict(fields)
+    if not fields.get("TenantID"):
+        fields["TenantID"] = GRAPH_TENANT_ID
+
+    async with httpx.AsyncClient() as c:
+        try:
+            r = await c.post(ignored_base, headers=headers, content=json.dumps({"fields": fields}), timeout=20)
+            r.raise_for_status()
+        except Exception as e:
+            return {"success": False, "error": f"create in IgnoredSecretRegistry failed: {e}"}
+
+    return {"success": True, "item_id": r.json().get("id")}
+
 async def create_jira_ticket(app_name: str, app_id: str, secret_id: str, secret_description: str, expiration_date: str, days_remaining: int, severity: str = "WARNING", priority: str = "High", extra_note: str = "") -> dict:
     days_text = f"EXPIRED {abs(days_remaining)} days ago" if days_remaining < 0 else f"{days_remaining} days remaining"
     summary_line = f"[{severity}] Azure Secret Expiry - {app_name} - {days_text}"
@@ -575,6 +614,7 @@ async def api_run_monitoring():
         add_jira_comment              = add_jira_comment,
         send_teams_alert              = send_teams_alert,
         move_secret_to_ignored        = move_secret_to_ignored,
+        create_ignored_row            = create_ignored_row,  # NEW — brand-new secret already 8+ days expired, straight to IgnoredSecretRegistry
         get_product_service_principal = get_product_service_principal,  # NEW — ProductName -> ManualAppOwners lookup
         owner_emails                  = OWNER_EMAILS,       # IGNORED by default — see manual_owners_only in decision_engine.py
         teams_tag_email               = TEAMS_TAG_EMAIL,    # person @mentioned on P1 alerts, from KV TEAMS-TAG-EMAIL
@@ -757,3 +797,5 @@ async def api_update_on_jira_reopen(req: JiraReopenReq):
     )
  
 log.info("REST API Server ready — GET /health | POST /tools/*")
+ 
+ 

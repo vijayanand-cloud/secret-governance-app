@@ -407,6 +407,9 @@ async def run_secret_monitoring(
     add_jira_comment:       Callable[[str, str], Awaitable[dict]],
     send_teams_alert:       Callable[..., Awaitable[dict]],
     move_secret_to_ignored: Callable[..., Awaitable[dict]] | None = None,  # -8-day abandoned-secret move
+    create_ignored_row:     Callable[[dict], Awaitable[dict]] | None = None,  # NEW - brand-new secret
+                                                         # already 8+ days expired -> straight to
+                                                         # IgnoredSecretRegistry, no master-list row at all
     get_product_service_principal: Callable[[str], Awaitable[str | None]] | None = None,
                                                          # NEW 1 looks up a Key Vault secret literally
                                                          # named after ProductName and returns its value
@@ -446,6 +449,7 @@ async def run_secret_monitoring(
         "productLookupsNotFound": 0,   # NEW 1 ProductName was filled in, but no matching KV secret exists
         "lineageMatchesFound": 0,      # NEW 1 new secrets that matched a parent row's NewSecretKeyId
         "movedToIgnored": 0,           # abandoned secrets (-8+ days, no ticket or Canceled) moved to IgnoredSecretRegistry
+        "newlyIgnored": 0,             # NEW - brand-new secrets already 8+ days expired, written straight to IgnoredSecretRegistry
         "errors": [],
     }
  
@@ -885,15 +889,14 @@ async def run_secret_monitoring(
     #     only THEN does a later monitoring run raise the ticket/alert for
     #     it. This is what lets monitoring's first run against an empty
     #     list act as a full discovery pass instead of only ever creating
-    #     P4 rows.
     quiet_new = [
         c for c in new_secrets
-        if c["bucket"] in ("P4", "Ignore") or not _is_owned_new(c)
+        if c["bucket"] == "P4" or (c["bucket"] != "Ignore" and not _is_owned_new(c))
     ]
     if quiet_new:
         summary["p4LoggedOnly"] += len([c for c in quiet_new if c["bucket"] == "P4"])
         print(f"[INFO] {len(quiet_new)} new secret(s) written with AlertStatus=Discovered, "
-              f"no ticket/alert yet (P4, Ignore, or app not yet owned)")
+              f"no ticket/alert yet (P4, or app not yet owned)")
 
         async def _write_quiet_new(c: dict):
             fields = {
@@ -934,6 +937,89 @@ async def run_secret_monitoring(
                 summary["errors"].append(res["error"])
             else:
                 summary["sharepointCreated"] += 1
+
+    # -- PHASE 3a: Ignore-bucket secrets brand new to monitoring --------------
+    # FIX (this version): a secret that's already 8+ days expired AND has
+    # never been seen by monitoring before now goes STRAIGHT to
+    # IgnoredSecretRegistry, matching runbook_discovery.py's original
+    # behavior exactly - it never gets a row in the master list at all, not
+    # even a Discovered one. Previously (the quiet_new fix, one version ago)
+    # these landed in the master list as Discovered and only got swept into
+    # IgnoredSecretRegistry on the FOLLOWING run once recognized as
+    # "existing". This removes that one-run delay for the Ignore case
+    # specifically, since there's nothing to wait on ownership for here -
+    # Ignore-bucket secrets never get a ticket/alert regardless of ownership,
+    # so there is no reason to hold them in the master list even briefly.
+    #
+    # Falls back to the old quiet-write-to-master-list behavior if
+    # create_ignored_row wasn't supplied by the caller (main.py), or if the
+    # write to IgnoredSecretRegistry fails for a given secret - the secret is
+    # still tracked somewhere either way, never silently dropped.
+    ignore_new = [c for c in new_secrets if c["bucket"] == "Ignore"]
+    if ignore_new:
+        print(f"[INFO] {len(ignore_new)} new secret(s) already 8+ days expired - "
+              f"writing straight to IgnoredSecretRegistry")
+
+        async def _write_ignore_new(c: dict):
+            ignored_fields = {
+                "Title":             c["app_id"],
+                "AppName":           c["app_name"],
+                "SecretID":          c["secret_id"],
+                "SecretDescription": c["secret_desc"],
+                "ExpirationDate":    c["expiration"],
+                "DaysExpired":       abs(c["days"]),
+                "TenantID":          c.get("tenant_id", ""),
+                "LoggedDate":        today,
+                "IgnoreReason":      "Expired8Plus",
+            }
+            if create_ignored_row is not None:
+                try:
+                    result = await create_ignored_row(ignored_fields)
+                    if result.get("success"):
+                        return {"error": None, "ignored": True}
+                    # Fall through to the master-list fallback below on failure.
+                except Exception as e:
+                    summary["errors"].append(
+                        f"create_ignored_row failed for {c['app_id']} - "
+                        f"falling back to a Discovered row in the master list: {e}"
+                    )
+
+            # Fallback: create_ignored_row unavailable or failed - write a
+            # plain Discovered row in the master list instead, same as any
+            # other bucket, so the secret is never silently dropped.
+            fallback_fields = {
+                "Title":             c["app_id"],
+                "AppName":           c["app_name"],
+                "SecretID":          c["secret_id"],
+                "SecretDescription": c["secret_desc"],
+                "ExpirationDate":    c["expiration"],
+                "ExpiryBucket":      c["bucket"],
+                "ExpiryNotice":      _expiry_notice(c["days"]),
+                "LastChecked":       today,
+                "AlertStatus":       "Discovered",
+                "AppOwners":         c.get("app_owners", ""),
+            }
+            if c.get("tenant_id"):
+                fallback_fields["TenantID"] = c["tenant_id"]
+            try:
+                await write_sharepoint_row(None, fallback_fields)
+                return {"error": None, "ignored": False}
+            except Exception as e:
+                return {"error": f"Ignore new-secret fallback SP write failed for {c['app_id']}: {e}",
+                        "ignored": False}
+
+        ignore_tasks   = [_write_ignore_new(c) for c in ignore_new]
+        ignore_results = await _run_batched(ignore_tasks, SP_WRITE_BATCH)
+        for res in ignore_results:
+            if isinstance(res, Exception):
+                summary["errors"].append(f"Ignore new-secret batch error: {res}")
+            elif res.get("error"):
+                summary["errors"].append(res["error"])
+            elif res.get("ignored"):
+                summary["newlyIgnored"] += 1
+            else:
+                summary["sharepointCreated"] += 1
+
  
     # ── PHASE 4: Handle existing secrets (batched) ────────────────────────────
     async def _process_existing(c: dict, existing: dict):
