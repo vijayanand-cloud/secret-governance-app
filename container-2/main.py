@@ -280,10 +280,11 @@ async def fetch_app_owners(app_id: str, tenant_id: str) -> str:
     Fetches owners of an App Registration from Entra ID, scoped to the
     SPECIFIC tenant this app lives in — tenant_id is now REQUIRED (was
     previously implicit/always-the-one-configured-tenant before multi-tenant
-    support). Returns a comma-separated string of owner emails/names.
+    support). Returns a comma-separated string of owner names.
  
     Owner types:
-      - User          → stored as UPN (email): 
+      - User          → stored as displayName (falls back to UPN/email only
+                         if Entra has no display name for that user)
       - Service Principal → stored as displayName: automation-pipeline
       - No owners     → returns empty string (admin fills manually in SharePoint)
     """
@@ -300,10 +301,12 @@ async def fetch_app_owners(app_id: str, tenant_id: str) -> str:
         for owner in owners:
             odata_type = owner.get("@odata.type", "")
             if "user" in odata_type.lower():
-                # User owner — use their email (UPN)
-                upn = owner.get("userPrincipalName") or owner.get("mail") or owner.get("displayName", "")
-                if upn:
-                    owner_list.append(upn)
+                # User owner — display name first (client requirement: names,
+                # not emails), fall back to UPN/email only if Entra genuinely
+                # has no display name for this user.
+                name = owner.get("displayName") or owner.get("userPrincipalName") or owner.get("mail", "")
+                if name:
+                    owner_list.append(name)
             elif "servicePrincipal" in odata_type:
                 # Service Principal owner — use display name
                 name = owner.get("displayName", "")
