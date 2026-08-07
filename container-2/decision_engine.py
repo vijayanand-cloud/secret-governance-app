@@ -640,23 +640,17 @@ async def run_secret_monitoring(
         for t in tenant_secret_counts
     }
  
-    # ── Build app DevSecOpsOwnership map from SP for ownership check on new secrets ─
-    # Keyed off DevSecOpsOwnership now, not AppOwners 1 see the FILTER note
-    # above. A brand-new secret for an app that already has DevSecOpsOwnership
-    # filled in on ANY of its existing rows is treated as actionable, same as
-    # discovery/rotation already treat DevSecOpsOwnership as an app-level (not
-    # per-secret) signal.
-    sp_app_owners: dict[str, str] = {}
-    for item in sp_data.get("items", []):
-        f      = item.get("fields", {})
-        app_id = f.get("Title", "")
-        if manual_owners_only:
-            owners = (f.get("DevSecOpsOwnership") or "").strip()
+    # -- Split into new vs existing ---------------------------------------------
+    new_secrets      = []
+    existing_secrets = []
+
+    for c in candidates:
+        existing = sp_index.get(c["secret_id"])  # SecretID alone, already globally unique
+        if existing is None:
+            new_secrets.append(c)
         else:
-            owners = (f.get("AppOwners") or "").strip()
-        if app_id and owners and app_id not in sp_app_owners:
-            sp_app_owners[app_id] = owners.lower()
- 
+            existing_secrets.append((c, existing))
+
     # ── Split into new vs existing ────────────────────────────────────────────
     new_secrets      = []
     existing_secrets = []
@@ -706,31 +700,27 @@ async def run_secret_monitoring(
                  f"parent row's NewSecretKeyId, copying TeamName/ProductName/"
                  f"ProductTeamkeyVaultName onto the new row")
     summary["lineageMatchesFound"] = lineage_matches_found
- 
-    # ── PHASE 1: Create Jira tickets for new secrets (batched) ───────────────
-    # Every bucket except P5/Ignore raises/maintains a Jira ticket now 1
+
+    # -- PHASE 1: Create Jira tickets for new secrets (batched) ------------------
+    # Every bucket except P4/Ignore raises/maintains a Jira ticket now -
     # see JIRA_TICKET_BUCKETS and the module docstring FIX note.
-    def _is_owned_new(c: dict) -> bool:
-        if manual_owners_only:
-            # A new secret is actionable only if ITS app already has a
-            # non-blank DevSecOpsOwnership on some existing row. A brand-new
-            # app with no rows at all yet has no DevSecOpsOwnership anywhere,
-            # so it is correctly NOT actionable until an admin fills that
-            # column in on at least one of its rows (this matches how
-            # runbook_discovery.py leaves DevSecOpsOwnership blank on every
-            # newly-created row, active or recovered).
-            return c["app_id"] in sp_app_owners
-        if not effective_owners:
-            return True
-        app_owners = sp_app_owners.get(c["app_id"], "")
-        if not app_owners:
-            return False
-        return any(email in app_owners for email in effective_owners)
- 
+    #
+    # FIX (this version): ownership is no longer a gate on ticket/alert
+    # creation, for new OR existing secrets. Previously a new secret was
+    # only actionable if its app already had DevSecOpsOwnership set on some
+    # existing row (_is_owned_new(), removed here), and the existing-secret
+    # path had an equivalent is_owned gate (removed from
+    # _handle_existing_secret() below). Explicit client requirement: tickets
+    # and Teams alerts should fire purely based on severity/bucket, not
+    # ownership. DevSecOpsOwnership still exists as a column and still gets
+    # set via sync.py/ProductName - it's just no longer a precondition for
+    # raising an alert. P4 and Ignore still never get a ticket/alert, since
+    # that's bucket-based, unrelated to ownership.
     actionable_new = [
         c for c in new_secrets
-        if c["bucket"] not in ("P4", "Ignore") and _is_owned_new(c)
+        if c["bucket"] not in ("P4", "Ignore")
     ]
+
  
     jira_bound_new = [c for c in actionable_new if c["bucket"] in JIRA_TICKET_BUCKETS]
     teams_only_new = [c for c in actionable_new if c["bucket"] not in JIRA_TICKET_BUCKETS]
@@ -889,10 +879,10 @@ async def run_secret_monitoring(
     #     only THEN does a later monitoring run raise the ticket/alert for
     #     it. This is what lets monitoring's first run against an empty
     #     list act as a full discovery pass instead of only ever creating
-    quiet_new = [
-        c for c in new_secrets
-        if c["bucket"] == "P4" or (c["bucket"] != "Ignore" and not _is_owned_new(c))
-    ]
+    # FIX: only P4 needs the quiet treatment now - P1/P2/P3/EMR always go to
+    # actionable_new above regardless of ownership (see the FIX note there),
+    # and Ignore is handled separately by Phase 3a below.
+    quiet_new = [c for c in new_secrets if c["bucket"] == "P4"]
     if quiet_new:
         summary["p4LoggedOnly"] += len([c for c in quiet_new if c["bucket"] == "P4"])
         print(f"[INFO] {len(quiet_new)} new secret(s) written with AlertStatus=Discovered, "
@@ -1024,19 +1014,15 @@ async def run_secret_monitoring(
     # ── PHASE 4: Handle existing secrets (batched) ────────────────────────────
     async def _process_existing(c: dict, existing: dict):
         try:
-            # FIX: same ownership signal _is_owned_new() already uses for brand-new
-            # secrets, now also passed into the existing-secret handler. Previously
-            # _handle_existing_secret() had NO ownership check anywhere in it -
-            # once a row existed (e.g. created by discovery, which deliberately
-            # leaves DevSecOpsOwnership blank), its self-heal and escalation logic
-            # would create/chase a Jira ticket for it purely off bucket + missing
-            # ticket, regardless of whether the app was actually owned yet.
-            is_owned = c["app_id"] in sp_app_owners
+            # FIX (this version): ownership gate removed - see the FIX note
+            # above actionable_new for the full reasoning. Tickets/alerts for
+            # existing rows now fire purely based on bucket, same as new
+            # secrets.
             result = await _handle_existing_secret(
                 c, c["bucket"], existing, today, summary,
                 write_sharepoint_row, create_jira_ticket,
                 get_jira_issue, add_jira_comment, send_teams_alert,
-                teams_tag_email, move_secret_to_ignored, is_owned,
+                teams_tag_email, move_secret_to_ignored,
             )
             return result
         except Exception as e:
@@ -1082,7 +1068,7 @@ async def _handle_existing_secret(
     c: dict, bucket: str, existing: dict, today: str, summary: dict,
     write_sharepoint_row, create_jira_ticket, get_jira_issue,
     add_jira_comment, send_teams_alert, teams_tag_email: str = "",
-    move_secret_to_ignored=None, is_owned: bool = True,
+    move_secret_to_ignored=None,
 ) -> dict:
     f            = existing.get("fields", {})
     item_id      = existing.get("id")
@@ -1251,28 +1237,11 @@ async def _handle_existing_secret(
                                f"SecretID={c['secret_id']}: {move_result.get('error')}")
         return result
 
-    # FIX: unowned existing row in a ticket-eligible bucket (P1/P2/P3/
-    # ExpiredManualReview) - previously nothing below this point checked
-    # ownership at all, so a row created blank by discovery would get a
-    # Jira ticket self-healed and escalated for it the moment monitoring
-    # first touched it, regardless of DevSecOpsOwnership being empty. This
-    # mirrors the P4 branch above: keep the row current (LastChecked,
-    # ExpiryNotice, ExpiryBucket, ExpirationDate, TenantID) but raise no
-    # ticket and send no alert until a human actually claims the app.
-    if not is_owned:
-        update_fields = {
-            "LastChecked":     today,
-            "ExpiryNotice":    notice,
-            "ExpiryBucket":    bucket,
-            "ExpirationDate":  c["expiration"],
-        }
-        if c.get("tenant_id"):
-            update_fields["TenantID"] = c["tenant_id"]
-        await write_sharepoint_row(item_id, update_fields)
-        result["sp_updated"] = True
-        return result
+    # FIX (this version): the unowned-row quiet-refresh gate that used to sit
+    # here has been removed - ownership no longer blocks self-heal/escalation
+    # for existing rows. See the FIX note above actionable_new for the full
+    # reasoning (explicit requirement: tickets/alerts fire on severity alone).
 
- 
     # Self-heal missing Jira ticket 1 now applies to EVERY bucket that
     # should have one: P1, P2, P3, P4, ExpiredManualReview. Previously this
     # only fired for P3/P4/ExpiredManualReview, matching the old (wrong)
