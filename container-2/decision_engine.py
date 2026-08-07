@@ -347,7 +347,10 @@ def _build_candidates(applications: list[dict], now: datetime) -> tuple[list[dic
     candidates: list[dict] = []
     errors: list[str] = []
     for app in applications:
-        app_id      = app.get("appId")
+        app_id        = app.get("appId")
+        app_object_id = app.get("id")   # Graph's /applications/{id}/owners needs
+                                          # the OBJECT id, not appId (client id) -
+                                          # fetch_app_owners() below requires this
         app_name    = app.get("displayName") or "Unknown"
         creds       = app.get("passwordCredentials") or []
         # Carries the tenant this app was actually fetched from (main.py's
@@ -368,7 +371,8 @@ def _build_candidates(applications: list[dict], now: datetime) -> tuple[list[dic
                 continue
             days = (exp - now).days
             candidates.append({
-                "app_id":      app_id,
+                "app_id":        app_id,
+                "app_object_id": app_object_id,
                 "app_name":    app_name,
                 "secret_id":   cred.get("keyId"),
                 "secret_desc": cred.get("displayName") or "N/A",
@@ -418,7 +422,11 @@ async def run_secret_monitoring(
                                                          # below for how this is used.
     owner_emails:           list[str] | None = None,   # DEPRECATED 1 see manual_owners_only below
     owner_email:            str = "",                  # DEPRECATED 1 see manual_owners_only below
-    fetch_app_owners:       Callable[[str], Awaitable[str]] | None = None,  # legacy 1 not used
+    fetch_app_owners:       Callable[[str, str], Awaitable[str]] | None = None,  # (app_object_id, tenant_id)
+                                                         # -> comma-separated owner emails/names, live from
+                                                         # Entra. FIX (this version): now actually wired up -
+                                                         # previously accepted but never passed from main.py's
+                                                         # call site, so AppOwners was unconditionally blank.
     get_owned_app_ids:      Callable[[], Awaitable[set]] | None = None,     # legacy 1 not used
     teams_tag_email:        str = "",                  # person to @mention on P1 alerts (from KV)
     manual_owners_only:     bool = True,                # filter is "does DevSecOpsOwnership have
@@ -639,7 +647,47 @@ async def run_secret_monitoring(
         t: {"apps": len(tenant_apps[t]), "secrets": tenant_secret_counts[t]}
         for t in tenant_secret_counts
     }
- 
+
+    # ── Fetch AppOwners from Entra, once per unique app (not per secret) ──────
+    # FIX (this version): AppOwners was always blank - fetch_app_owners() was
+    # a real, working Graph call, but was never passed through from main.py's
+    # call site, and nothing ever set a candidate's "app_owners" key. Wired up
+    # here: one Graph call per unique (tenant, app object id) pair - a given
+    # app can have several secrets/candidates in the same run, and there is
+    # no reason to look its owners up more than once - batched the same way
+    # every other Graph/SharePoint call in this file already is.
+    if fetch_app_owners is not None:
+        unique_apps: dict[tuple[str, str], None] = {}
+        for c in candidates:
+            key = (c.get("tenant_id", ""), c.get("app_object_id", ""))
+            if key[1] and key not in unique_apps:
+                unique_apps[key] = None
+
+        async def _fetch_owner(key: tuple[str, str]):
+            tenant_id, app_object_id = key
+            try:
+                owners = await fetch_app_owners(app_object_id, tenant_id)
+                return key, owners
+            except Exception as e:
+                return key, ""
+
+        owner_tasks   = [_fetch_owner(key) for key in unique_apps]
+        owner_results = await _run_batched(owner_tasks, SP_WRITE_BATCH)
+        owner_cache: dict[tuple[str, str], str] = {}
+        for res in owner_results:
+            if isinstance(res, Exception):
+                summary["errors"].append(f"fetch_app_owners batch error: {res}")
+                continue
+            key, owners = res
+            owner_cache[key] = owners
+
+        for c in candidates:
+            key = (c.get("tenant_id", ""), c.get("app_object_id", ""))
+            c["app_owners"] = owner_cache.get(key, "")
+    else:
+        for c in candidates:
+            c["app_owners"] = ""
+
     # -- Split into new vs existing ---------------------------------------------
     new_secrets      = []
     existing_secrets = []
@@ -1109,6 +1157,10 @@ async def _handle_existing_secret(
         # GRAPH_TENANT_ID (home-tenant) fallback whenever this key is omitted.
         if c.get("tenant_id"):
             update_fields["TenantID"] = c["tenant_id"]
+        # Re-stamp AppOwners on every touch too, unconditionally (unlike
+        # TenantID above) - an empty owner list from Entra is real, current
+        # data, not a gap to protect a previous value from.
+        update_fields["AppOwners"] = c.get("app_owners", "")
         await write_sharepoint_row(item_id, update_fields)
         result["sp_updated"] = True
         return result
@@ -1153,6 +1205,10 @@ async def _handle_existing_secret(
             # GRAPH_TENANT_ID (home-tenant) fallback whenever this key is omitted.
             if c.get("tenant_id"):
                 update_fields["TenantID"] = c["tenant_id"]
+            # Re-stamp AppOwners on every touch too, unconditionally (unlike
+            # TenantID above) - an empty owner list from Entra is real, current
+            # data, not a gap to protect a previous value from.
+            update_fields["AppOwners"] = c.get("app_owners", "")
             await write_sharepoint_row(item_id, update_fields)
             result["sp_updated"] = True
             return result
@@ -1312,6 +1368,10 @@ async def _handle_existing_secret(
         # GRAPH_TENANT_ID (home-tenant) fallback whenever this key is omitted.
         if c.get("tenant_id"):
             update_fields["TenantID"] = c["tenant_id"]
+        # Re-stamp AppOwners on every touch too, unconditionally (unlike
+        # TenantID above) - an empty owner list from Entra is real, current
+        # data, not a gap to protect a previous value from.
+        update_fields["AppOwners"] = c.get("app_owners", "")
         if jira_key:
             update_fields["JiraTicketKey"] = jira_key
             if "JiraTicketCreatedDate" not in f:
@@ -1347,6 +1407,10 @@ async def _handle_existing_secret(
         # GRAPH_TENANT_ID (home-tenant) fallback whenever this key is omitted.
         if c.get("tenant_id"):
             update_fields["TenantID"] = c["tenant_id"]
+        # Re-stamp AppOwners on every touch too, unconditionally (unlike
+        # TenantID above) - an empty owner list from Entra is real, current
+        # data, not a gap to protect a previous value from.
+        update_fields["AppOwners"] = c.get("app_owners", "")
         if jira_key:
             update_fields["JiraTicketKey"] = jira_key
         await write_sharepoint_row(item_id, update_fields)

@@ -701,6 +701,7 @@ async def api_run_monitoring():
         move_secret_to_ignored        = move_secret_to_ignored,
         create_ignored_row            = create_ignored_row,  # NEW — brand-new secret already 8+ days expired, straight to IgnoredSecretRegistry
         get_product_service_principal = get_product_service_principal,  # NEW — ProductName -> ManualAppOwners lookup
+        fetch_app_owners              = fetch_app_owners,   # NEW — wires up real AppOwners population from Entra (was previously dead)
         owner_emails                  = OWNER_EMAILS,       # IGNORED by default — see manual_owners_only in decision_engine.py
         teams_tag_email               = TEAMS_TAG_EMAIL,    # person @mentioned on P1 alerts, from KV TEAMS-TAG-EMAIL
     )
