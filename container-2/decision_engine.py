@@ -1135,7 +1135,11 @@ async def _handle_existing_secret(
         # True TERMINAL_STATUSES (Rotated/Ignored/Resolved) get nothing at
         # all, since there's nothing left to keep current on a closed row.
         if alert_status == "RotatedPendingDeployment" or alert_status in PAUSED_STATUSES:
-            await write_sharepoint_row(item_id, {"ExpiryNotice": notice, "LastChecked": today})
+            paused_fields = {"ExpiryNotice": notice, "LastChecked": today}
+            if c.get("tenant_id"):
+                paused_fields["TenantID"] = c["tenant_id"]
+            paused_fields["AppOwners"] = c.get("app_owners", "")
+            await write_sharepoint_row(item_id, paused_fields)
             result["sp_updated"] = True
         return result
  
@@ -1233,12 +1237,16 @@ async def _handle_existing_secret(
                 # investigated rather than silently disappearing into Ignored
                 # while still technically unrotated in SharePoint's eyes.
                 should_move = False
-                await write_sharepoint_row(item_id, {
+                sync_gap_fields = {
                     "LastChecked":  today,
                     "ExpiryNotice": (f"⚠ SYNC GAP 1 Jira ticket {jira_key} is "
                                     f"'{jira_status_for_note}' but this row was never "
                                     f"marked Rotated. Check the Jira automation rule."),
-                })
+                }
+                if c.get("tenant_id"):
+                    sync_gap_fields["TenantID"] = c["tenant_id"]
+                sync_gap_fields["AppOwners"] = c.get("app_owners", "")
+                await write_sharepoint_row(item_id, sync_gap_fields)
                 result["sp_updated"] = True
                 return result
             else:
@@ -1255,14 +1263,18 @@ async def _handle_existing_secret(
                 should_move = False
  
         if not should_move:
-            await write_sharepoint_row(item_id, {
+            overdue_fields = {
                 "LastChecked":   today,
                 "AlertStatus":   "OverdueManualReview",
                 "ExpiryNotice":  (f"OVERDUE {abs(c['days'])} days - ticket "
                                  f"{jira_key or '(none)'} still "
                                  f"'{jira_status_for_note}', not auto-ignored, "
                                  f"not auto-rotated, human review required"),
-            })
+            }
+            if c.get("tenant_id"):
+                overdue_fields["TenantID"] = c["tenant_id"]
+            overdue_fields["AppOwners"] = c.get("app_owners", "")
+            await write_sharepoint_row(item_id, overdue_fields)
             result["sp_updated"] = True
             return result
  
@@ -1323,7 +1335,11 @@ async def _handle_existing_secret(
         jira_open    = status_name not in CLOSED_NAMES
  
     if jira_key and not jira_open:
-        await write_sharepoint_row(item_id, {"ExpiryNotice": notice, "LastChecked": today})
+        closed_ticket_fields = {"ExpiryNotice": notice, "LastChecked": today}
+        if c.get("tenant_id"):
+            closed_ticket_fields["TenantID"] = c["tenant_id"]
+        closed_ticket_fields["AppOwners"] = c.get("app_owners", "")
+        await write_sharepoint_row(item_id, closed_ticket_fields)
         result["sp_updated"] = True
         return result
  
