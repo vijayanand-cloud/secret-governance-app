@@ -579,6 +579,9 @@ async def get_list_state(list_id: str) -> dict:
     async with httpx.AsyncClient() as c:
         while url:
             r = await c.get(url, headers=headers, timeout=30)
+            if not r.is_success:
+                log.error("get_list_state Graph error [%s] for list %s: %s",
+                          r.status_code, list_id, r.text[:2000])
             r.raise_for_status()
             b = r.json()
             items.extend(b.get("value", []))
@@ -590,6 +593,9 @@ async def create_list_row(list_id: str, fields: dict) -> dict:
     url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{list_id}/items"
     async with httpx.AsyncClient() as c:
         r = await c.post(url, headers=headers, content=json.dumps({"fields": fields}), timeout=20)
+        if not r.is_success:
+            log.error("create_list_row Graph error [%s] for list %s: %s",
+                      r.status_code, list_id, r.text[:2000])
         r.raise_for_status()
         return {"item_id": r.json().get("id")}
 
@@ -599,6 +605,8 @@ async def delete_list_row(list_id: str, item_id: str) -> dict:
     async with httpx.AsyncClient() as c:
         r = await c.delete(url, headers=headers, timeout=20)
         if r.status_code not in (204, 404):
+            log.error("delete_list_row Graph error [%s] for list %s item %s: %s",
+                      r.status_code, list_id, item_id, r.text[:2000])
             r.raise_for_status()
         return {"deleted": True}
 
