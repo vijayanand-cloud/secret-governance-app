@@ -397,7 +397,130 @@ async def _run_batched(tasks: list, batch_size: int, pause: float = BATCH_PAUSE)
         if i + batch_size < len(tasks):
             await asyncio.sleep(pause)
     return results
- 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BACKUP ROTATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Mirrors main.py's own backup_list_row_fields()/_SP_SYSTEM_FIELDS exactly -
+# kept here too since this file builds the rows being backed up and main.py
+# is the actual Graph HTTP boundary, same reasoning as
+# _build_teams_mention_payload being duplicated between these two files.
+_SP_SYSTEM_FIELDS = {
+    "id", "ContentType", "Modified", "Created", "AuthorLookupId", "EditorLookupId",
+    "_UIVersionString", "Attachments", "Edit", "LinkTitleNoMenu", "LinkTitle",
+    "ItemChildCount", "FolderChildCount", "AppEditorLookupId", "_ComplianceFlags",
+    "_ComplianceTag", "_ComplianceTagWrittenTime", "_ComplianceTagUserId",
+    "_CommentCount", "_LikeCount", "_DisplayName", "OData__UIVersionString",
+}
+
+def backup_list_row_fields(source_fields: dict) -> dict:
+    """Strips SharePoint system/read-only fields, keeps everything else as-is."""
+    return {k: v for k, v in source_fields.items() if k not in _SP_SYSTEM_FIELDS}
+
+async def _rotate_backup_list(
+    list_label: str,
+    current_items: list[dict],
+    backup_list_id: str,
+    get_list_state,
+    create_list_row,
+    delete_list_row,
+    upload_backup_to_storage,   # None if Storage isn't configured - treated as "not present", not a failure
+    summary: dict,
+) -> bool:
+    """
+    Snapshots current_items (the live current state of a source list, e.g.
+    SecretAlertRegistry or IgnoredSecretRegistry) into backup_list_id.
+
+    Ordering is deliberately archive-then-write-then-delete-old, per an
+    explicit requirement: the previous backup is NEVER deleted before the
+    new one is safely in place.
+
+      1. Read whatever's currently in the backup list.
+      2. If it's non-empty AND a Storage upload function is configured,
+         archive it there first. A Storage upload that's configured but
+         actually FAILS aborts the whole run - this is a real failure of
+         something expected to work, not a "not configured" case.
+         If Storage genuinely isn't configured (upload_backup_to_storage is
+         None), that old content is simply not archived - not an error.
+      3. Write a fresh snapshot of current_items into the backup list as NEW
+         items, without touching the old ones yet. If this fails partway,
+         delete the new items already created (revert to exactly how the
+         backup list looked before this run touched it) and abort - nothing
+         downstream runs this cycle.
+      4. Only once the new snapshot is fully and successfully written are the
+         OLD backup-list rows deleted. A failure here is logged but NOT
+         fatal - the data-safety goal (archived old + new snapshot present)
+         is already met; stray old rows are a lesser problem worth fixing by
+         hand, not worth aborting the run over.
+
+    Returns True if the run should proceed, False if it should abort.
+    """
+    if not backup_list_id:
+        print(f"[INFO] Backup rotation ({list_label}): no backup list configured - skipped.")
+        return True
+
+    try:
+        existing_backup = await get_list_state(backup_list_id)
+    except Exception as e:
+        summary["errors"].append(
+            f"Backup rotation ({list_label}): failed to read existing backup list - aborting run: {e}")
+        return False
+
+    old_items = existing_backup.get("items", [])
+
+    if old_items:
+        if upload_backup_to_storage is not None:
+            blob_name = f"{list_label}_{_now_est_string().replace(' ', '_').replace(':', '-')}.json"
+            archive_result = await upload_backup_to_storage(blob_name, old_items)
+            if not archive_result.get("success"):
+                summary["errors"].append(
+                    f"Backup rotation ({list_label}): archiving previous backup to Storage failed - "
+                    f"aborting run without touching anything: {archive_result.get('error')}")
+                return False
+            print(f"[INFO] Backup rotation ({list_label}): archived {len(old_items)} previous "
+                  f"backup row(s) to Storage as {blob_name}")
+        else:
+            print(f"[INFO] Backup rotation ({list_label}): Storage not configured - previous "
+                  f"{len(old_items)} backup row(s) will be discarded (not archived) once the "
+                  f"new snapshot is written.")
+
+    new_item_ids: list[str] = []
+    write_failed = False
+    for row in current_items:
+        try:
+            fields = backup_list_row_fields(row.get("fields", {}))
+            created = await create_list_row(backup_list_id, fields)
+            new_item_ids.append(created["item_id"])
+        except Exception as e:
+            summary["errors"].append(
+                f"Backup rotation ({list_label}): snapshot write failed partway "
+                f"({len(new_item_ids)}/{len(current_items)}) - reverting: {e}")
+            write_failed = True
+            break
+
+    if write_failed:
+        for item_id in new_item_ids:
+            try:
+                await delete_list_row(backup_list_id, item_id)
+            except Exception as e:
+                summary["errors"].append(
+                    f"Backup rotation ({list_label}): revert cleanup failed for item "
+                    f"{item_id} - may need manual cleanup: {e}")
+        return False
+
+    for item in old_items:
+        try:
+            await delete_list_row(backup_list_id, item["id"])
+        except Exception as e:
+            summary["errors"].append(
+                f"Backup rotation ({list_label}): failed to delete old backup row "
+                f"{item.get('id')} (non-fatal): {e}")
+
+    print(f"[INFO] Backup rotation ({list_label}): wrote {len(new_item_ids)} fresh row(s) "
+          f"to backup list, removed {len(old_items)} old row(s).")
+    return True
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN ORCHESTRATOR
 # ─────────────────────────────────────────────────────────────────────────────
@@ -437,6 +560,17 @@ async def run_secret_monitoring(
                                                          # need to change its call site signature
                                                          # immediately. Set False to restore the old
                                                          # AppOwners/OWNER_EMAILS matching.
+    # NEW - pre-run backup rotation. All optional/independently gated: a
+    # missing backup_list_id skips that list's backup entirely; a missing
+    # upload_backup_to_storage skips archival but still rotates the
+    # SharePoint-side backup list. See _rotate_backup_list() below.
+    get_ignored_sharepoint_state: Callable[[], Awaitable[dict]] | None = None,
+    backup_list_id:            str = "",
+    ignored_backup_list_id:    str = "",
+    get_list_state:             Callable[[str], Awaitable[dict]] | None = None,
+    create_list_row:            Callable[[str, dict], Awaitable[dict]] | None = None,
+    delete_list_row:            Callable[[str, str], Awaitable[dict]] | None = None,
+    upload_backup_to_storage:   Callable[[str, list], Awaitable[dict]] | None = None,
 ) -> dict:
     now   = datetime.now(timezone.utc)
     today = _now_est_string()  # full EST timestamp, matches runbook_discovery.py
@@ -458,6 +592,8 @@ async def run_secret_monitoring(
         "lineageMatchesFound": 0,      # NEW 1 new secrets that matched a parent row's NewSecretKeyId
         "movedToIgnored": 0,           # abandoned secrets (-8+ days, no ticket or Canceled) moved to IgnoredSecretRegistry
         "newlyIgnored": 0,             # NEW - brand-new secrets already 8+ days expired, written straight to IgnoredSecretRegistry
+        "masterListBackedUp": False,   # NEW - SecretAlertRegistry successfully snapshotted before this run touched it
+        "ignoredListBackedUp": False,  # NEW - IgnoredSecretRegistry successfully snapshotted before this run touched it
         "errors": [],
     }
  
@@ -473,7 +609,38 @@ async def run_secret_monitoring(
     except Exception as e:
         summary["errors"].append(f"get_sharepoint_state failed: {e}")
         return summary
- 
+
+    # ── Backup rotation - BEFORE anything else touches either list ───────────
+    # Must run here, before the ProductName-lookup/propagation steps just
+    # below (which already write to the master list) - backing up after
+    # those would snapshot already-modified data, defeating the point.
+    if get_list_state is not None and create_list_row is not None and delete_list_row is not None:
+        ok = await _rotate_backup_list(
+            "SecretAlertRegistry", sp_data.get("items", []), backup_list_id,
+            get_list_state, create_list_row, delete_list_row, upload_backup_to_storage, summary,
+        )
+        summary["masterListBackedUp"] = ok
+        if not ok:
+            summary["errors"].append("Monitoring run ABORTED - master list backup failed before any real work started.")
+            return summary
+
+        if ignored_backup_list_id and get_ignored_sharepoint_state is not None:
+            try:
+                ignored_data_for_backup = await get_ignored_sharepoint_state()
+            except Exception as e:
+                summary["errors"].append(f"Monitoring run ABORTED - could not read IgnoredSecretRegistry for backup: {e}")
+                return summary
+            ok = await _rotate_backup_list(
+                "IgnoredSecretRegistry", ignored_data_for_backup.get("items", []), ignored_backup_list_id,
+                get_list_state, create_list_row, delete_list_row, upload_backup_to_storage, summary,
+            )
+            summary["ignoredListBackedUp"] = ok
+            if not ok:
+                summary["errors"].append("Monitoring run ABORTED - ignored list backup failed before any real work started.")
+                return summary
+    else:
+        print("[INFO] Backup rotation: get_list_state/create_list_row/delete_list_row not wired up - skipping backup entirely.")
+
     # ── ProductName lookup, BEFORE propagation and BEFORE filtering ───────────
     # A row can have ProductName filled in instead of DevSecOpsOwnership being
     # typed in directly. If it is, look up a Key Vault secret literally named

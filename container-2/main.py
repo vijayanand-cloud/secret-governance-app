@@ -108,7 +108,40 @@ except Exception as exc:
     SHAREPOINT_IGNORED_LIST_ID = ""
     log.warning("SHAREPOINT-IGNORED-LIST-ID not set — abandoned secrets (no ticket or "
                 "Canceled, past -8 days) will NOT be moved to IgnoredSecretRegistry: %s", exc)
- 
+
+# BACKUP LISTS — NEW. Before each monitoring run touches SecretAlertRegistry
+# or IgnoredSecretRegistry, their current state is snapshotted into these
+# dedicated backup lists (SharePoint has no built-in point-in-time backup for
+# a list). Falls back to "" (backup skipped, logged) rather than crashing the
+# container if not yet provisioned.
+try:
+    SHAREPOINT_BACKUP_LIST_ID = _kv_get("SHAREPOINT-BACKUP-LIST-ID")
+except Exception as exc:
+    SHAREPOINT_BACKUP_LIST_ID = ""
+    log.warning("SHAREPOINT-BACKUP-LIST-ID not set — SecretAlertRegistry will NOT "
+                "be backed up before each run: %s", exc)
+try:
+    SHAREPOINT_IGNORED_BACKUP_LIST_ID = _kv_get("SHAREPOINT-IGNORED-BACKUP-LIST-ID")
+except Exception as exc:
+    SHAREPOINT_IGNORED_BACKUP_LIST_ID = ""
+    log.warning("SHAREPOINT-IGNORED-BACKUP-LIST-ID not set — IgnoredSecretRegistry "
+                "will NOT be backed up before each run: %s", exc)
+
+# BACKUP-STORAGE-ACCOUNT-URL — NEW, DELIBERATELY OPTIONAL. Blob endpoint for
+# archiving the PREVIOUS backup-list snapshot before it's overwritten by a
+# fresh one each run. If not set, the rolling SharePoint-side backup still
+# works (the old snapshot is just discarded instead of archived) rather than
+# blocking monitoring entirely on a Storage Account that may not exist yet -
+# see decision_engine.py's _rotate_backup_list() for the exact behavior.
+try:
+    BACKUP_STORAGE_ACCOUNT_URL = _kv_get("BACKUP-STORAGE-ACCOUNT-URL").strip().rstrip("/")
+except Exception:
+    BACKUP_STORAGE_ACCOUNT_URL = ""
+    log.warning("BACKUP-STORAGE-ACCOUNT-URL not set — the previous backup-list "
+                "snapshot will be discarded each run instead of archived to "
+                "Storage. Only the SharePoint-side rolling backup will run.")
+BACKUP_CONTAINER_NAME = "secret-governance-backups"
+
 try:
     JIRA_PROJECT_KEY = _kv_get("JIRA-PROJECT-KEY").strip()
 except Exception:
@@ -504,6 +537,110 @@ async def get_ignored_sharepoint_state() -> dict:
             url = b.get("@odata.nextLink")
     return {"items": items, "count": len(items)}
 
+# ─────────────────────────────────────────────────────────────────────────────
+# BACKUP / ARCHIVE — NEW. Generic helpers for the pre-run backup feature: both
+# SecretAlertRegistry and IgnoredSecretRegistry get snapshotted into their own
+# backup list before monitoring touches anything, and whatever was already IN
+# that backup list gets archived to a Storage Account first if one is
+# configured. See decision_engine.py's _rotate_backup_list() for the actual
+# ordering/revert logic that calls these.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Graph fields that are system/read-only - never send these back on a create,
+# SharePoint rejects or silently ignores most of them anyway. Filtering these
+# OUT (rather than allowlisting business columns IN) means this works against
+# any list's current schema without needing to know its exact columns ahead
+# of time - new columns added to the source list later get backed up
+# automatically, no code change needed here.
+_SP_SYSTEM_FIELDS = {
+    "id", "ContentType", "Modified", "Created", "AuthorLookupId", "EditorLookupId",
+    "_UIVersionString", "Attachments", "Edit", "LinkTitleNoMenu", "LinkTitle",
+    "ItemChildCount", "FolderChildCount", "AppEditorLookupId", "_ComplianceFlags",
+    "_ComplianceTag", "_ComplianceTagWrittenTime", "_ComplianceTagUserId",
+    "_CommentCount", "_LikeCount", "_DisplayName", "OData__UIVersionString",
+}
+
+def backup_list_row_fields(source_fields: dict) -> dict:
+    """Strips SharePoint system/read-only fields, keeps everything else as-is."""
+    return {k: v for k, v in source_fields.items() if k not in _SP_SYSTEM_FIELDS}
+
+async def get_list_state(list_id: str) -> dict:
+    """
+    Generic reader, parameterized by list ID - same shape as
+    get_sharepoint_state()/get_ignored_sharepoint_state(), used so the backup
+    rotation logic can read/write EITHER backup list with one function
+    instead of two near-duplicates.
+    """
+    if not list_id:
+        return {"items": [], "count": 0}
+    headers = {"Authorization": f"Bearer {await _sp_graph_token()}"}
+    url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{list_id}/items?$expand=fields"
+    items = []
+    async with httpx.AsyncClient() as c:
+        while url:
+            r = await c.get(url, headers=headers, timeout=30)
+            r.raise_for_status()
+            b = r.json()
+            items.extend(b.get("value", []))
+            url = b.get("@odata.nextLink")
+    return {"items": items, "count": len(items)}
+
+async def create_list_row(list_id: str, fields: dict) -> dict:
+    headers = {"Authorization": f"Bearer {await _sp_graph_token()}", "Content-Type": "application/json"}
+    url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{list_id}/items"
+    async with httpx.AsyncClient() as c:
+        r = await c.post(url, headers=headers, content=json.dumps({"fields": fields}), timeout=20)
+        r.raise_for_status()
+        return {"item_id": r.json().get("id")}
+
+async def delete_list_row(list_id: str, item_id: str) -> dict:
+    headers = {"Authorization": f"Bearer {await _sp_graph_token()}"}
+    url = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{list_id}/items/{item_id}"
+    async with httpx.AsyncClient() as c:
+        r = await c.delete(url, headers=headers, timeout=20)
+        if r.status_code not in (204, 404):
+            r.raise_for_status()
+        return {"deleted": True}
+
+async def _storage_token() -> str:
+    """
+    Token for the Storage Blob REST API - a DIFFERENT resource audience than
+    Graph, so this cannot reuse _sp_graph_token()/_graph_token_for_tenant()
+    even though it's the same underlying managed identity (_credential).
+    """
+    token = _credential.get_token("https://storage.azure.com/.default")
+    return token.token
+
+async def upload_backup_to_storage(blob_name: str, items: list[dict]) -> dict:
+    """
+    Uploads a JSON snapshot (a backup list's full item set, captured right
+    before it gets overwritten by a newer one) to the dedicated backup
+    Storage Account. A no-op returning skipped=True if
+    BACKUP_STORAGE_ACCOUNT_URL isn't configured - the caller treats that as
+    "storage not present" and falls back to a simpler delete-old/write-new
+    flow with no archival, rather than failing the whole run over it.
+    """
+    if not BACKUP_STORAGE_ACCOUNT_URL:
+        return {"success": False, "skipped": True, "error": "BACKUP_STORAGE_ACCOUNT_URL not configured"}
+
+    body = json.dumps(items, indent=2, default=str).encode("utf-8")
+    url = f"{BACKUP_STORAGE_ACCOUNT_URL}/{BACKUP_CONTAINER_NAME}/{blob_name}"
+    headers = {
+        "Authorization": f"Bearer {await _storage_token()}",
+        "x-ms-version": "2021-08-06",
+        "x-ms-blob-type": "BlockBlob",
+        "Content-Type": "application/json",
+        "Content-Length": str(len(body)),
+    }
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.put(url, headers=headers, content=body, timeout=60)
+            if not r.is_success:
+                return {"success": False, "error": f"HTTP {r.status_code}: {r.text[:300]}"}
+        return {"success": True, "blob_name": blob_name}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 def _days_expired_from_expiration(expiration_str: str) -> int:
     """Best-effort parse of the EST-formatted ExpirationDate string back into
     a days-expired count, for rebuilding IgnoredSecretRegistry's DaysExpired
@@ -707,6 +844,14 @@ async def api_run_monitoring():
         fetch_app_owners              = fetch_app_owners,   # NEW — wires up real AppOwners population from Entra (was previously dead)
         owner_emails                  = OWNER_EMAILS,       # IGNORED by default — see manual_owners_only in decision_engine.py
         teams_tag_email               = TEAMS_TAG_EMAIL,    # person @mentioned on P1 alerts, from KV TEAMS-TAG-EMAIL
+        # NEW — pre-run backup rotation, see decision_engine.py's _rotate_backup_list()
+        get_ignored_sharepoint_state  = get_ignored_sharepoint_state,
+        backup_list_id                = SHAREPOINT_BACKUP_LIST_ID,
+        ignored_backup_list_id        = SHAREPOINT_IGNORED_BACKUP_LIST_ID,
+        get_list_state                = get_list_state,
+        create_list_row                = create_list_row,
+        delete_list_row                = delete_list_row,
+        upload_backup_to_storage      = (upload_backup_to_storage if BACKUP_STORAGE_ACCOUNT_URL else None),
     )
  
 class JiraCloseReq(BaseModel):
