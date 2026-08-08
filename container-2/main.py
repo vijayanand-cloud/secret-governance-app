@@ -555,7 +555,7 @@ async def get_ignored_sharepoint_state() -> dict:
 _SP_SYSTEM_FIELDS = {
     "id", "ContentType", "Modified", "Created", "AuthorLookupId", "EditorLookupId",
     "_UIVersionString", "Attachments", "Edit", "LinkTitleNoMenu", "LinkTitle",
-    "ItemChildCount", "FolderChildCount", "AppEditorLookupId", "_ComplianceFlags",
+    "ItemChildCount", "FolderChildCount", "AppEditorLookupId", "AppAuthorLookupId", "_ComplianceFlags",
     "_ComplianceTag", "_ComplianceTagWrittenTime", "_ComplianceTagUserId",
     "_CommentCount", "_LikeCount", "_DisplayName", "OData__UIVersionString",
 }
