@@ -1004,6 +1004,7 @@ async def run_secret_monitoring(
             "ExpiryBucket":       bucket,
             "AlertHistory":       f"[{today}] Alert generated at severity {bucket}.",
             "AppOwners":          c.get("app_owners", ""),
+            "ObjectID":           c.get("app_object_id", ""),
         }
         # Stamp the ACTUAL tenant this app was scanned from, not just
         # whatever write_sharepoint_row's own GRAPH_TENANT_ID fallback would
@@ -1115,6 +1116,7 @@ async def run_secret_monitoring(
                 "LastChecked":       today,
                 "AlertStatus":       "Discovered",
                 "AppOwners":         c.get("app_owners", ""),
+                "ObjectID":          c.get("app_object_id", ""),
             }
             if c.get("tenant_id"):
                 fields["TenantID"]   = c["tenant_id"]
@@ -1203,6 +1205,7 @@ async def run_secret_monitoring(
                 "LastChecked":       today,
                 "AlertStatus":       "Discovered",
                 "AppOwners":         c.get("app_owners", ""),
+                "ObjectID":          c.get("app_object_id", ""),
             }
             if c.get("tenant_id"):
                 fallback_fields["TenantID"] = c["tenant_id"]
@@ -1306,6 +1309,7 @@ async def _handle_existing_secret(
             if c.get("tenant_id"):
                 paused_fields["TenantID"] = c["tenant_id"]
             paused_fields["AppOwners"] = c.get("app_owners", "")
+            paused_fields["ObjectID"] = c.get("app_object_id", "")
             await write_sharepoint_row(item_id, paused_fields)
             result["sp_updated"] = True
         return result
@@ -1332,10 +1336,11 @@ async def _handle_existing_secret(
         # TenantID above) - an empty owner list from Entra is real, current
         # data, not a gap to protect a previous value from.
         update_fields["AppOwners"] = c.get("app_owners", "")
+        update_fields["ObjectID"] = c.get("app_object_id", "")
         await write_sharepoint_row(item_id, update_fields)
         result["sp_updated"] = True
         return result
- 
+
     if bucket == "Ignore":
         # The -8-DAY ABANDONMENT CHECK. A secret crossing into "Ignore"
         # (8+ days past expiry) is NOT automatically moved to
@@ -1380,6 +1385,7 @@ async def _handle_existing_secret(
             # TenantID above) - an empty owner list from Entra is real, current
             # data, not a gap to protect a previous value from.
             update_fields["AppOwners"] = c.get("app_owners", "")
+            update_fields["ObjectID"] = c.get("app_object_id", "")
             await write_sharepoint_row(item_id, update_fields)
             result["sp_updated"] = True
             return result
@@ -1413,6 +1419,7 @@ async def _handle_existing_secret(
                 if c.get("tenant_id"):
                     sync_gap_fields["TenantID"] = c["tenant_id"]
                 sync_gap_fields["AppOwners"] = c.get("app_owners", "")
+                sync_gap_fields["ObjectID"] = c.get("app_object_id", "")
                 await write_sharepoint_row(item_id, sync_gap_fields)
                 result["sp_updated"] = True
                 return result
@@ -1441,6 +1448,7 @@ async def _handle_existing_secret(
             if c.get("tenant_id"):
                 overdue_fields["TenantID"] = c["tenant_id"]
             overdue_fields["AppOwners"] = c.get("app_owners", "")
+            overdue_fields["ObjectID"] = c.get("app_object_id", "")
             await write_sharepoint_row(item_id, overdue_fields)
             result["sp_updated"] = True
             return result
@@ -1506,6 +1514,7 @@ async def _handle_existing_secret(
         if c.get("tenant_id"):
             closed_ticket_fields["TenantID"] = c["tenant_id"]
         closed_ticket_fields["AppOwners"] = c.get("app_owners", "")
+        closed_ticket_fields["ObjectID"] = c.get("app_object_id", "")
         await write_sharepoint_row(item_id, closed_ticket_fields)
         result["sp_updated"] = True
         return result
@@ -1555,6 +1564,7 @@ async def _handle_existing_secret(
         # TenantID above) - an empty owner list from Entra is real, current
         # data, not a gap to protect a previous value from.
         update_fields["AppOwners"] = c.get("app_owners", "")
+        update_fields["ObjectID"] = c.get("app_object_id", "")
         if jira_key:
             update_fields["JiraTicketKey"] = jira_key
             if "JiraTicketCreatedDate" not in f:
@@ -1594,6 +1604,7 @@ async def _handle_existing_secret(
         # TenantID above) - an empty owner list from Entra is real, current
         # data, not a gap to protect a previous value from.
         update_fields["AppOwners"] = c.get("app_owners", "")
+        update_fields["ObjectID"] = c.get("app_object_id", "")
         if jira_key:
             update_fields["JiraTicketKey"] = jira_key
         await write_sharepoint_row(item_id, update_fields)
