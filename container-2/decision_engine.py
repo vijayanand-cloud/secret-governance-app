@@ -485,37 +485,70 @@ async def _rotate_backup_list(
                   f"{len(old_items)} backup row(s) will be discarded (not archived) once the "
                   f"new snapshot is written.")
 
-    new_item_ids: list[str] = []
-    write_failed = False
-    for row in current_items:
+    # FIX (this version): was a plain sequential loop - 1327 rows meant 1327
+    # sequential HTTP round-trips, taking minutes. Since /run's background
+    # task has no active inbound HTTP request while this runs, Container
+    # Apps' scale-to-zero could kill the replica mid-loop, silently dropping
+    # the rest of the backup. Batched the same way every other bulk write in
+    # this file already is.
+    async def _create_one(row: dict):
         try:
             fields = backup_list_row_fields(row.get("fields", {}))
             created = await create_list_row(backup_list_id, fields)
-            new_item_ids.append(created["item_id"])
+            return {"item_id": created["item_id"], "error": None}
         except Exception as e:
-            summary["errors"].append(
-                f"Backup rotation ({list_label}): snapshot write failed partway "
-                f"({len(new_item_ids)}/{len(current_items)}) - reverting: {e}")
-            write_failed = True
-            break
+            return {"item_id": None, "error": str(e)}
 
-    if write_failed:
-        for item_id in new_item_ids:
+    create_tasks   = [_create_one(row) for row in current_items]
+    create_results = await _run_batched(create_tasks, SP_WRITE_BATCH)
+
+    new_item_ids: list[str] = []
+    first_error = None
+    for res in create_results:
+        if isinstance(res, Exception):
+            first_error = first_error or str(res)
+            continue
+        if res.get("error"):
+            first_error = first_error or res["error"]
+            continue
+        new_item_ids.append(res["item_id"])
+
+    if first_error:
+        summary["errors"].append(
+            f"Backup rotation ({list_label}): snapshot write failed "
+            f"({len(new_item_ids)}/{len(current_items)} succeeded before the failure) - "
+            f"reverting: {first_error}")
+
+        async def _delete_one_revert(item_id: str):
             try:
                 await delete_list_row(backup_list_id, item_id)
+                return None
             except Exception as e:
-                summary["errors"].append(
-                    f"Backup rotation ({list_label}): revert cleanup failed for item "
-                    f"{item_id} - may need manual cleanup: {e}")
+                return str(e)
+
+        revert_tasks   = [_delete_one_revert(iid) for iid in new_item_ids]
+        revert_results = await _run_batched(revert_tasks, SP_WRITE_BATCH)
+        for err in revert_results:
+            if isinstance(err, Exception):
+                summary["errors"].append(f"Backup rotation ({list_label}): revert cleanup failed - may need manual cleanup: {err}")
+            elif err:
+                summary["errors"].append(f"Backup rotation ({list_label}): revert cleanup failed - may need manual cleanup: {err}")
         return False
 
-    for item in old_items:
+    async def _delete_one_old(item: dict):
         try:
             await delete_list_row(backup_list_id, item["id"])
+            return None
         except Exception as e:
-            summary["errors"].append(
-                f"Backup rotation ({list_label}): failed to delete old backup row "
-                f"{item.get('id')} (non-fatal): {e}")
+            return f"Backup rotation ({list_label}): failed to delete old backup row {item.get('id')} (non-fatal): {e}"
+
+    old_delete_tasks   = [_delete_one_old(item) for item in old_items]
+    old_delete_results = await _run_batched(old_delete_tasks, SP_WRITE_BATCH)
+    for err in old_delete_results:
+        if isinstance(err, Exception):
+            summary["errors"].append(f"Backup rotation ({list_label}): failed to delete an old backup row (non-fatal): {err}")
+        elif err:
+            summary["errors"].append(err)
 
     print(f"[INFO] Backup rotation ({list_label}): wrote {len(new_item_ids)} fresh row(s) "
           f"to backup list, removed {len(old_items)} old row(s).")
