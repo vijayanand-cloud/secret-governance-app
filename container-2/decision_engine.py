@@ -625,6 +625,7 @@ async def run_secret_monitoring(
         "lineageMatchesFound": 0,      # NEW 1 new secrets that matched a parent row's NewSecretKeyId
         "movedToIgnored": 0,           # abandoned secrets (-8+ days, no ticket or Canceled) moved to IgnoredSecretRegistry
         "newlyIgnored": 0,             # NEW - brand-new secrets already 8+ days expired, written straight to IgnoredSecretRegistry
+        "alreadyIgnoredSkipped": 0,    # FIX - secrets already sitting in IgnoredSecretRegistry, correctly recognized and not re-added
         "masterListBackedUp": False,   # NEW - SecretAlertRegistry successfully snapshotted before this run touched it
         "ignoredListBackedUp": False,  # NEW - IgnoredSecretRegistry successfully snapshotted before this run touched it
         "errors": [],
@@ -1195,7 +1196,32 @@ async def run_secret_monitoring(
     # create_ignored_row wasn't supplied by the caller (main.py), or if the
     # write to IgnoredSecretRegistry fails for a given secret - the secret is
     # still tracked somewhere either way, never silently dropped.
-    ignore_new = [c for c in new_secrets if c["bucket"] == "Ignore"]
+    #
+    # FIX (this version): "new" here only means "not found in sp_index", and
+    # sp_index is built exclusively from SecretAlertRegistry (the master
+    # list) - it was never cross-checked against IgnoredSecretRegistry. A
+    # secret already sitting in IgnoredSecretRegistry is, by definition,
+    # absent from the master list, so every single run it kept looking
+    # "new" again here and got a FRESH row created in IgnoredSecretRegistry
+    # via create_ignored_row() - one extra duplicate row per run, forever,
+    # for every secret already tracked there. Fetching the current ignored
+    # SecretIDs and filtering them out before writing closes that gap.
+    already_ignored_secret_ids: set[str] = set()
+    if get_ignored_sharepoint_state is not None:
+        try:
+            ignored_state_now = await get_ignored_sharepoint_state()
+            already_ignored_secret_ids = {
+                item.get("fields", {}).get("SecretID", "")
+                for item in ignored_state_now.get("items", [])
+            }
+        except Exception as e:
+            summary["errors"].append(
+                f"Could not read IgnoredSecretRegistry to de-duplicate new Ignore-bucket "
+                f"secrets - proceeding without de-duplication this run: {e}")
+
+    all_ignore_new = [c for c in new_secrets if c["bucket"] == "Ignore"]
+    ignore_new = [c for c in all_ignore_new if c["secret_id"] not in already_ignored_secret_ids]
+    summary["alreadyIgnoredSkipped"] = len(all_ignore_new) - len(ignore_new)
     if ignore_new:
         print(f"[INFO] {len(ignore_new)} new secret(s) already 8+ days expired - "
               f"writing straight to IgnoredSecretRegistry")
