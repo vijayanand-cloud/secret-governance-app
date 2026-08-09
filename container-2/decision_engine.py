@@ -471,7 +471,7 @@ async def _rotate_backup_list(
 
     if old_items:
         if upload_backup_to_storage is not None:
-            blob_name = f"{list_label}_{_now_est_string().replace(' ', '_').replace(':', '-')}.json"
+            blob_name = f"{list_label}_{_now_est_string().replace(' ', '_').replace(':', '-')}.csv"
             archive_result = await upload_backup_to_storage(blob_name, old_items)
             if not archive_result.get("success"):
                 summary["errors"].append(

@@ -4,6 +4,8 @@ Azure Entra Secret Monitoring — REST API (Replaces FastMCP)
 from __future__ import annotations
  
 import base64 as _b64
+import csv
+import io
 import json
 import logging
 import os
@@ -619,9 +621,34 @@ async def _storage_token() -> str:
     token = _credential.get_token("https://storage.azure.com/.default")
     return token.token
 
+def _items_to_csv(items: list[dict]) -> bytes:
+    """
+    Flattens Graph list items down to just their `fields` dict (the actual
+    SharePoint column values - id/createdDateTime/parentReference/etc. from
+    the Graph envelope aren't useful in a CSV export) and serializes as CSV,
+    one row per item. Columns are the union of every field name seen across
+    all items, in first-seen order, so a row missing a given column just
+    gets an empty cell rather than the whole export failing.
+    """
+    rows = [item.get("fields", {}) for item in items]
+    fieldnames: list[str] = []
+    seen = set()
+    for row in rows:
+        for k in row.keys():
+            if k not in seen:
+                seen.add(k)
+                fieldnames.append(k)
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return buf.getvalue().encode("utf-8")
+
 async def upload_backup_to_storage(blob_name: str, items: list[dict]) -> dict:
     """
-    Uploads a JSON snapshot (a backup list's full item set, captured right
+    Uploads a CSV snapshot (a backup list's full item set, captured right
     before it gets overwritten by a newer one) to the dedicated backup
     Storage Account. A no-op returning skipped=True if
     BACKUP_STORAGE_ACCOUNT_URL isn't configured - the caller treats that as
@@ -631,13 +658,13 @@ async def upload_backup_to_storage(blob_name: str, items: list[dict]) -> dict:
     if not BACKUP_STORAGE_ACCOUNT_URL:
         return {"success": False, "skipped": True, "error": "BACKUP_STORAGE_ACCOUNT_URL not configured"}
 
-    body = json.dumps(items, indent=2, default=str).encode("utf-8")
+    body = _items_to_csv(items)
     url = f"{BACKUP_STORAGE_ACCOUNT_URL}/{BACKUP_CONTAINER_NAME}/{blob_name}"
     headers = {
         "Authorization": f"Bearer {await _storage_token()}",
         "x-ms-version": "2021-08-06",
         "x-ms-blob-type": "BlockBlob",
-        "Content-Type": "application/json",
+        "Content-Type": "text/csv",
         "Content-Length": str(len(body)),
     }
     try:
