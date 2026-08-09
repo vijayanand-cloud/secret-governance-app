@@ -741,10 +741,9 @@ async def create_jira_ticket(app_name: str, app_id: str, secret_id: str, secret_
     if JIRA_EPIC_KEY and JIRA_EPIC_KEY != "CSD-123": payload["fields"]["parent"] = {"key": JIRA_EPIC_KEY}
     async with httpx.AsyncClient() as c:
         r = await c.post(f"{JIRA_BASE_URL}/rest/api/2/issue", headers={"Authorization": _jira_auth(), "Content-Type": "application/json"}, content=json.dumps(payload), timeout=20)
+        if not r.is_success:
+            log.error("create_jira_ticket failed [%s] for app_id=%s: %s", r.status_code, app_id, r.text[:500])
         r.raise_for_status()
-        # if not r.is_success:
-        #     log.error("create_jira_ticket failed [%s]: %s", r.status_code, r.text[:500])
-        #     r.raise_for_status()
         return {"issue_key": r.json()["key"]}
  
 async def get_jira_issue(issue_key: str) -> dict:
