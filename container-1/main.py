@@ -316,12 +316,16 @@ class JiraStatusUpdateReq(BaseModel):
     # what actually parses the incoming request from Jira Automation (this
     # proxy is the externally-reachable endpoint), and Pydantic silently
     # drops any field not declared here before req.dict() forwards it on to
-    # Container 2. Missing these three would mean Container 2 always sees
-    # them as None, silently defeating the SharePoint backfill-on-Resolved
-    # feature with no error anywhere.
+    # Container 2. Missing any of these would mean Container 2 always sees
+    # them as None, silently defeating the SharePoint backfill feature with
+    # no error anywhere.
     team_name:           Optional[str] = None
     product_name:        Optional[str] = None
-    devsecops_ownership: Optional[str] = None
+    devsecops_ownership: Optional[str] = None  # DEPRECATED - no longer sent, see Container 2
+    product_teams_key_vault_name: Optional[str] = None
+    new_secret_vault_name:        Optional[str] = None
+    new_secret_key_id:            Optional[str] = None
+    new_secret_present:           Optional[str] = None
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
  

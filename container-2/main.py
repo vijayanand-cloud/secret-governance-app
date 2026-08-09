@@ -922,13 +922,23 @@ class JiraStatusUpdateReq(BaseModel):
     jira_key:  str
     to_status: str   # Jira destination status name, exact text from the workflow
     today:     str
-    # Populated from the Jira issue's TeamName/ProductName/DevSecOpsOwnership
-    # custom fields (see automation rule body below). Only used to backfill
-    # the matching SharePoint row on a Resolved transition, and only when
-    # that row's own column is empty — never overwrites an existing value.
+    # Populated from the Jira issue's custom fields (see automation rule body
+    # below). Backfilled into the matching SharePoint row on In Progress AND
+    # Resolved (a "second check" at Resolve), only when that row's own
+    # column is empty — never overwrites an existing value.
     team_name:           Optional[str] = None
     product_name:        Optional[str] = None
-    devsecops_ownership: Optional[str] = None
+    devsecops_ownership: Optional[str] = None  # DEPRECATED — DevSecOpsOwnership was
+                                                # removed from Jira; ownership is now
+                                                # resolved via sync.py's ProductName ->
+                                                # Key Vault lookup instead. Left as an
+                                                # accepted-but-unused field rather than
+                                                # removed, since nothing currently sends it.
+    # NEW — added for the To Do -> In Progress workflow gate.
+    product_teams_key_vault_name: Optional[str] = None
+    new_secret_vault_name:        Optional[str] = None
+    new_secret_key_id:            Optional[str] = None
+    new_secret_present:           Optional[str] = None  # "Yes"/"No" from Jira's NewSecretPresent field
 
 @app.post("/tools/jira-status-update")
 async def api_jira_status_update(req: JiraStatusUpdateReq):
@@ -968,22 +978,29 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
                  Container 1's port is the one that also needs to stay
                  reachable for the scheduled /run trigger)
         Body   : {
-                   "jira_key":            "{{issue.key}}",
-                   "to_status":           "{{destinationStatus.name}}",
-                   "today":               "{{now.jiraDate}}",
-                   "team_name":           "{{issue.customfield_10113}}",
-                   "product_name":        "{{issue.customfield_10110}}",
-                   "devsecops_ownership": "{{issue.customfield_10112}}"
+                   "jira_key":                     "{{issue.key}}",
+                   "to_status":                    "{{destinationStatus.name}}",
+                   "today":                        "{{now.jiraDate}}",
+                   "team_name":                    "{{issue.customfield_10147}}",
+                   "product_name":                 "{{issue.customfield_10148}}",
+                   "product_teams_key_vault_name": "{{issue.customfield_10149}}",
+                   "new_secret_vault_name":        "{{issue.customfield_10150}}",
+                   "new_secret_key_id":            "{{issue.customfield_10151}}",
+                   "new_secret_present":           "{{issue.customfield_10152}}"
                  }
         NOTE: {{now.format('yyyy-MM-dd')}} (single-quoted arg) has been seen
         to fail with "Unable to render smart values" in some Jira
         environments, which silently kills the whole request before it's
         ever sent - {{now.jiraDate}} is the confirmed-working equivalent.
-        NOTE: customfield_10110/10112/10113 are KAN project field IDs
-        (ProductName/DevSecOpsOwnership/TeamName respectively) - these are
-        only sent so a Resolved transition can backfill an empty SharePoint
-        row; they're harmless no-ops on every other transition since the
-        backfill logic only reads them when status is Done/Resolved.
+        NOTE: customfield_10147/10148/10149/10150/10151/10152 are KAN
+        project field IDs (TeamName/ProductName/ProductTeamsKeyVaultName/
+        NewSecretVaultName/NewSecretKeyId/NewSecretPresent respectively) -
+        these IDs changed when the fields were recreated as dropdowns; the
+        old DevSecOpsOwnership field (customfield_10112) was removed
+        entirely and is deliberately NOT sent anymore. Sent on both In
+        Progress and Resolved so the backfill below can run at either
+        transition - harmless no-ops on every other transition since the
+        backfill logic only reads them when status is In Progress/Done/Resolved.
 
     SharePoint AlertStatus mapping:
       Done                                        -> Rotated
@@ -1069,6 +1086,25 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
         return {"updated": 0, "jira_key": req.jira_key,
                 "note": f"Status '{req.to_status}' not mapped - no action taken"}
 
+    # NEW - immediate acknowledgment when the engineer marks a secret NOT
+    # already present (NewSecretPresent = No) at ticket intake. Fires once,
+    # right at the In Progress transition, rather than waiting until actual
+    # rotation happens (which could be a long time later, once the secret
+    # nears its threshold days) - the engineer gets confirmation their input
+    # was received immediately instead of silence until much later.
+    if status == "in progress" and (req.new_secret_present or "").strip().lower() == "no":
+        try:
+            await add_jira_comment(
+                req.jira_key,
+                "✅ Noted — this secret is scheduled for automatic rotation. "
+                "No manual action is needed; the rotation runbook will "
+                "generate a new secret once it's due and update this ticket "
+                "and SharePoint automatically.",
+            )
+        except Exception as e:
+            log.warning("jira-status-update: failed to add NewSecretPresent=No "
+                        "acknowledgment comment for %s: %s", req.jira_key, e)
+
     # -- Step 1: search the master list first, same as before -----------------
     sp_data = await get_sharepoint_state()
     master_matches = [item for item in sp_data.get("items", [])
@@ -1111,20 +1147,34 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
                     "LastChecked":  today,
                     **extra_fields,
                 }
-                if status in DONE_STATUSES:
+                if status in DONE_STATUSES or status in REOPEN_STATUSES:
                     # Backfill only — never overwrites a value someone already
-                    # set in SharePoint. req.team_name/product_name/
-                    # devsecops_ownership come from the Jira issue's own
-                    # required-on-Resolve fields, so by the time this fires
-                    # they're guaranteed non-empty on the Jira side; this just
-                    # closes the gap when the SharePoint row itself was never
-                    # populated.
+                    # set in SharePoint. Fires on BOTH In Progress and
+                    # Resolved now (Resolved acts as a "second check" per
+                    # explicit client requirement, since a field cleared
+                    # after In Progress would otherwise never get re-synced).
+                    # devsecops_ownership is never actually sent anymore
+                    # (DevSecOpsOwnership was removed from Jira) so this
+                    # branch is a permanent no-op for it, harmlessly.
                     if not f.get("TeamName") and req.team_name:
                         fields["TeamName"] = req.team_name
                     if not f.get("ProductName") and req.product_name:
                         fields["ProductName"] = req.product_name
                     if not f.get("DevSecOpsOwnership") and req.devsecops_ownership:
                         fields["DevSecOpsOwnership"] = req.devsecops_ownership
+                    if not f.get("ProductTeamsKeyVaultName") and req.product_teams_key_vault_name:
+                        fields["ProductTeamsKeyVaultName"] = req.product_teams_key_vault_name
+                    if not f.get("NewSecretVaultName") and req.new_secret_vault_name:
+                        fields["NewSecretVaultName"] = req.new_secret_vault_name
+                    if not f.get("NewSecretKeyId") and req.new_secret_key_id:
+                        fields["NewSecretKeyId"] = req.new_secret_key_id
+                    # NOTE: new_secret_present is deliberately NOT written to
+                    # SharePoint - there's no column for it. It only exists
+                    # to trigger the "scheduled for autorotation" Jira
+                    # comment above. The rotation runbook infers the same
+                    # Yes/No distinction by checking whether NewSecretKeyId
+                    # (backfilled just above, when the engineer typed one in)
+                    # is already non-empty - no separate column needed.
                 await write_sharepoint_row(item["id"], fields)
                 updated += 1
                 log.info("jira-status-update: item=%s jira=%s -> AlertStatus=%s",
