@@ -313,6 +313,22 @@ def _classify_bucket(days: int) -> str:
     return "Ignore"
  
 def _days_remaining(expiration_iso: str, now: datetime) -> int | None:
+    """
+    FIX: ExpirationDate is written by decision_engine.py/discovery.py as an
+    EST/EDT 12-hour string via _format_datetime_est(), e.g.
+    "2026-08-16 01:57:23 AM" - NOT ISO 8601. datetime.fromisoformat() cannot
+    parse that format at all and raised on every single row, silently
+    returning None here and skipping every candidate before rotation ever
+    got a chance to run - the ISO branch below is now only a fallback for
+    any legacy rows still holding an old-format value.
+    """
+    try:
+        exp = datetime.strptime(expiration_iso, "%Y-%m-%d %I:%M:%S %p")
+        exp = exp.replace(tzinfo=_EASTERN_TZ)
+        return (exp - now).days
+    except Exception:
+        pass
+
     try:
         if len(expiration_iso) == 10:
             expiration_iso += "T00:00:00+00:00"
@@ -488,9 +504,14 @@ def get_jira_issue(issue_key: str) -> dict:
         raise
  
 def add_jira_comment(issue_key: str, comment_text: str) -> dict:
-    payload = {"body": {"type": "doc", "version": 1,
-                        "content": [{"type": "paragraph",
-                                     "content": [{"type": "text", "text": comment_text}]}]}}
+    """
+    FIX: /rest/api/2/issue/{key}/comment expects a plain string body, not an
+    ADF document object - the ADF wrapper this used to send failed every
+    call with HTTP 400 "Comment body is not valid!". Matches main.py's
+    (container 2's) add_jira_comment(), which already sends a plain string
+    against this same v2 endpoint and works.
+    """
+    payload = {"body": comment_text}
     b = _post(f"{JIRA_BASE_URL}/rest/api/2/issue/{issue_key}/comment",
               _jira_hdrs(), payload, timeout=15)
     return {"issue_key": issue_key, "comment_id": b.get("id", "")}

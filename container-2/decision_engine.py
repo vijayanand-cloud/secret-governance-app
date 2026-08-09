@@ -914,7 +914,7 @@ async def run_secret_monitoring(
     # When a secret rotates, rotation creates a brand-new Entra secret (new
     # SecretID) and records that new ID in the OLD row's NewSecretKeyId
     # column. The team fills TeamName, ProductName, and
-    # ProductTeamkeyVaultName in BY HAND only once, the first time an app is
+    # ProductTeamsKeyVaultName in BY HAND only once, the first time an app is
     # onboarded 1 every year after that, when the new secret shows up here
     # as a "new" secret with no row of its own yet, this checks whether its
     # ID matches some EXISTING row's NewSecretKeyId. If it does, that
@@ -935,7 +935,7 @@ async def run_secret_monitoring(
             lineage_by_new_secret_id[new_id] = {
                 "TeamName":                f.get("TeamName", ""),
                 "ProductName":              f.get("ProductName", ""),
-                "ProductTeamkeyVaultName":  f.get("ProductTeamkeyVaultName", ""),
+                "ProductTeamsKeyVaultName":  f.get("ProductTeamsKeyVaultName", ""),
             }
  
     lineage_matches_found = 0
@@ -946,7 +946,7 @@ async def run_secret_monitoring(
             lineage_matches_found += 1
             print(f"[INFO] Lineage match - secret {c['secret_id']} for {c['app_name']} matches a "
                  f"parent row's NewSecretKeyId, copying TeamName/ProductName/"
-                 f"ProductTeamkeyVaultName onto the new row")
+                 f"ProductTeamsKeyVaultName onto the new row")
     summary["lineageMatchesFound"] = lineage_matches_found
 
     # -- PHASE 1: Create Jira tickets for new secrets (batched) ------------------
@@ -1057,7 +1057,7 @@ async def run_secret_monitoring(
         if lineage:
             fields["TeamName"]               = lineage["TeamName"]
             fields["ProductName"]            = lineage["ProductName"]
-            fields["ProductTeamkeyVaultName"] = lineage["ProductTeamkeyVaultName"]
+            fields["ProductTeamsKeyVaultName"] = lineage["ProductTeamsKeyVaultName"]
  
         teams_sent = False
         if bucket in TEAMS_ALERT_BUCKETS:
@@ -1155,13 +1155,13 @@ async def run_secret_monitoring(
                 fields["TenantID"]   = c["tenant_id"]
             # Same lineage carry-over as the ticket/alert path above, so a
             # quietly-written row still gets TeamName/ProductName/
-            # ProductTeamkeyVaultName copied over if it matched a parent
+            # ProductTeamsKeyVaultName copied over if it matched a parent
             # row's NewSecretKeyId.
             lineage = c.get("lineage_fields")
             if lineage:
                 fields["TeamName"]               = lineage["TeamName"]
                 fields["ProductName"]            = lineage["ProductName"]
-                fields["ProductTeamkeyVaultName"] = lineage["ProductTeamkeyVaultName"]
+                fields["ProductTeamsKeyVaultName"] = lineage["ProductTeamsKeyVaultName"]
             try:
                 await write_sharepoint_row(None, fields)
                 return {"error": None}
