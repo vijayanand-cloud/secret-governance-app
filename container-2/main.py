@@ -981,12 +981,12 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
                    "jira_key":                     "{{issue.key}}",
                    "to_status":                    "{{destinationStatus.name}}",
                    "today":                        "{{now.jiraDate}}",
-                   "team_name":                    "{{issue.customfield_10147}}",
-                   "product_name":                 "{{issue.customfield_10148}}",
-                   "product_teams_key_vault_name": "{{issue.customfield_10149}}",
+                   "team_name":                    "{{issue.customfield_10147.value}}",
+                   "product_name":                 "{{issue.customfield_10148.value}}",
+                   "product_teams_key_vault_name": "{{issue.customfield_10149.value}}",
                    "new_secret_vault_name":        "{{issue.customfield_10150}}",
                    "new_secret_key_id":            "{{issue.customfield_10151}}",
-                   "new_secret_present":           "{{issue.customfield_10152}}"
+                   "new_secret_present":           "{{issue.customfield_10152.value}}"
                  }
         NOTE: {{now.format('yyyy-MM-dd')}} (single-quoted arg) has been seen
         to fail with "Unable to render smart values" in some Jira
@@ -1001,6 +1001,13 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
         Progress and Resolved so the backfill below can run at either
         transition - harmless no-ops on every other transition since the
         backfill logic only reads them when status is In Progress/Done/Resolved.
+        NOTE: TeamName/ProductName/ProductTeamsKeyVaultName/NewSecretPresent
+        are select-list (dropdown) fields - Jira's API returns those as an
+        object ({id, value, self}), not a plain string, so the smart value
+        needs ".value" appended (e.g. {{issue.customfield_10147.value}}) or
+        the field arrives empty even though the ticket has one selected.
+        NewSecretVaultName/NewSecretKeyId are plain free-text fields and
+        must NOT get ".value" - they're already a string.
 
     SharePoint AlertStatus mapping:
       Done                                        -> Rotated
