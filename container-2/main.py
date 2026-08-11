@@ -1049,6 +1049,14 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
     reverse lookup even if their ticket is later reopened - only rows
     ignored from this point forward are covered.
     """
+    log.info(
+        "jira-status-update: RAW request received: jira_key=%r to_status=%r today=%r "
+        "team_name=%r product_name=%r product_teams_key_vault_name=%r "
+        "new_secret_vault_name=%r new_secret_key_id=%r new_secret_present=%r",
+        req.jira_key, req.to_status, req.today, req.team_name, req.product_name,
+        req.product_teams_key_vault_name, req.new_secret_vault_name,
+        req.new_secret_key_id, req.new_secret_present,
+    )
     today  = req.today
     status = req.to_status.strip().lower()
 
