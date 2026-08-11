@@ -978,7 +978,7 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
                  reachable for the scheduled /run trigger)
         Body   : {
                    "jira_key":                     "{{issue.key}}",
-                   "to_status":                    "{{destinationStatus.name}}",
+                   "to_status":                    "{{issue.status.name}}",
                    "today":                        "{{now.jiraDate}}",
                    "team_name":                    "{{issue.customfield_10185.value}}",
                    "product_name":                 "{{issue.customfield_10186.value}}",
@@ -991,6 +991,16 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
         to fail with "Unable to render smart values" in some Jira
         environments, which silently kills the whole request before it's
         ever sent - {{now.jiraDate}} is the confirmed-working equivalent.
+        NOTE: to_status uses {{issue.status.name}}, NOT {{destinationStatus.name}}
+        - the latter looks like the more "correct" smart value for a
+        transition trigger and is what Atlassian's own docs typically show,
+        but it does not reliably resolve in this rule's automation builder;
+        it arrived as an empty string on every real transition tested,
+        confirmed via raw request logging in this endpoint, while every
+        {{issue.*}} value in the same body resolved correctly every time.
+        Since a rule's actions run AFTER its transition has completed,
+        {{issue.status.name}} already reflects the new status by request
+        time, and it's the one proven reliable here.
         NOTE: customfield_10185/10186/10187/10188/10189/10190 are KAN
         project field IDs (TeamName/ProductName/NewSecretPresent/
         NewSecretKeyId/NewSecretVaultName/ProductTeamsKeyVaultName
