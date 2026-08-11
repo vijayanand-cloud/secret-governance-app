@@ -980,33 +980,40 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
                    "jira_key":                     "{{issue.key}}",
                    "to_status":                    "{{destinationStatus.name}}",
                    "today":                        "{{now.jiraDate}}",
-                   "team_name":                    "{{issue.customfield_10147.value}}",
-                   "product_name":                 "{{issue.customfield_10148.value}}",
-                   "product_teams_key_vault_name": "{{issue.customfield_10149.value}}",
-                   "new_secret_vault_name":        "{{issue.customfield_10150}}",
-                   "new_secret_key_id":            "{{issue.customfield_10151}}",
-                   "new_secret_present":           "{{issue.customfield_10152.value}}"
+                   "team_name":                    "{{issue.customfield_10185.value}}",
+                   "product_name":                 "{{issue.customfield_10186.value}}",
+                   "product_teams_key_vault_name": "{{issue.customfield_10190.value}}",
+                   "new_secret_vault_name":        "{{issue.customfield_10189}}",
+                   "new_secret_key_id":            "{{issue.customfield_10188}}",
+                   "new_secret_present":           "{{issue.customfield_10187.value}}"
                  }
         NOTE: {{now.format('yyyy-MM-dd')}} (single-quoted arg) has been seen
         to fail with "Unable to render smart values" in some Jira
         environments, which silently kills the whole request before it's
         ever sent - {{now.jiraDate}} is the confirmed-working equivalent.
-        NOTE: customfield_10147/10148/10149/10150/10151/10152 are KAN
-        project field IDs (TeamName/ProductName/ProductTeamsKeyVaultName/
-        NewSecretVaultName/NewSecretKeyId/NewSecretPresent respectively) -
-        these IDs changed when the fields were recreated as dropdowns; the
-        old DevSecOpsOwnership field (customfield_10112) was removed
-        entirely and is deliberately NOT sent anymore. Sent on both In
-        Progress and Resolved so the backfill below can run at either
-        transition - harmless no-ops on every other transition since the
-        backfill logic only reads them when status is In Progress/Done/Resolved.
+        NOTE: customfield_10185/10186/10187/10188/10189/10190 are KAN
+        project field IDs (TeamName/ProductName/NewSecretPresent/
+        NewSecretKeyId/NewSecretVaultName/ProductTeamsKeyVaultName
+        respectively) - these IDs change every time a field is deleted and
+        recreated (Jira never reuses a customfield_NNNNN number), so check
+        them against the project's current field list before trusting any
+        past version of this docstring. The old DevSecOpsOwnership field
+        (customfield_10112 in an earlier iteration) was removed entirely
+        and is deliberately NOT sent anymore. Sent on both In Progress and
+        Resolved so the backfill below can run at either transition -
+        harmless no-ops on every other transition since the backfill logic
+        only reads them when status is In Progress/Done/Resolved.
         NOTE: TeamName/ProductName/ProductTeamsKeyVaultName/NewSecretPresent
         are select-list (dropdown) fields - Jira's API returns those as an
         object ({id, value, self}), not a plain string, so the smart value
-        needs ".value" appended (e.g. {{issue.customfield_10147.value}}) or
+        needs ".value" appended (e.g. {{issue.customfield_10185.value}}) or
         the field arrives empty even though the ticket has one selected.
         NewSecretVaultName/NewSecretKeyId are plain free-text fields and
         must NOT get ".value" - they're already a string.
+        NOTE: there is also a customfield_10191 (NewSecretVaultPresent) on
+        this issue type now - a Jira-only Yes/No gate deciding whether
+        NewSecretVaultName is required, enforced entirely by Jira Automation
+        rules, not sent in this body since the backend has no use for it.
 
     SharePoint AlertStatus mapping:
       Done                                        -> Rotated
