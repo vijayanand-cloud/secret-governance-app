@@ -924,7 +924,8 @@ class JiraStatusUpdateReq(BaseModel):
     # Populated from the Jira issue's custom fields (see automation rule body
     # below). Backfilled into the matching SharePoint row on In Progress AND
     # Resolved (a "second check" at Resolve), only when that row's own
-    # column is empty — never overwrites an existing value.
+    # column is empty — never overwrites an existing value. Unless
+    # overwrite=True, see below.
     team_name:           Optional[str] = None
     product_name:        Optional[str] = None
     devsecops_ownership: Optional[str] = None  # DEPRECATED — DevSecOpsOwnership was
@@ -938,6 +939,17 @@ class JiraStatusUpdateReq(BaseModel):
     new_secret_vault_name:        Optional[str] = None
     new_secret_key_id:            Optional[str] = None
     new_secret_present:           Optional[str] = None  # "Yes"/"No" from Jira's NewSecretPresent field
+    # NEW — set True by a separate "field value changed" Jira automation rule
+    # (not the status-transition rule above), fired when an engineer edits
+    # TeamName/ProductName/ProductTeamsKeyVaultName/NewSecretVaultName/
+    # NewSecretKeyId directly, with no status transition involved. Unlike the
+    # status-transition path, this OVERWRITES the SharePoint column
+    # unconditionally rather than only filling blanks — explicit client
+    # requirement: an engineer correcting a field after the fact should see
+    # that correction actually take effect. The Jira-side rule's own
+    # condition already restricts this to non-Resolved tickets; status is
+    # re-checked server-side too, defensively, before honoring this flag.
+    overwrite: bool = False
 
 @app.post("/tools/jira-status-update")
 async def api_jira_status_update(req: JiraStatusUpdateReq):
@@ -1178,7 +1190,37 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
                     "LastChecked":  today,
                     **extra_fields,
                 }
-                if status in DONE_STATUSES or status in REOPEN_STATUSES:
+                if req.overwrite and status not in DONE_STATUSES:
+                    # NEW - explicit field-edit sync, fired by a separate
+                    # "field value changed" Jira automation rule rather than
+                    # the status-transition rule. Unlike the fill-blanks
+                    # backfill below, this OVERWRITES the SharePoint column
+                    # unconditionally whenever Jira carries a non-empty
+                    # value for it - an engineer correcting a field after
+                    # the fact must see that correction actually take
+                    # effect. Deliberately allowed for ANY non-Resolved
+                    # status (To Do, In Progress, Waiting for Customer), not
+                    # just In Progress - the Jira-side rule's own condition
+                    # already restricts this to non-Resolved tickets, and
+                    # "status not in DONE_STATUSES" re-checks that here too,
+                    # defensively, in case that condition is ever removed or
+                    # misconfigured on the Jira side.
+                    #
+                    # This can overwrite a value rotation itself already
+                    # wrote (NewSecretVaultName/NewSecretKeyId) - by explicit
+                    # client instruction, engineers are expected to make all
+                    # corrections before rotation runs, not after.
+                    if req.team_name:
+                        fields["TeamName"] = req.team_name
+                    if req.product_name:
+                        fields["ProductName"] = req.product_name
+                    if req.product_teams_key_vault_name:
+                        fields["ProductTeamsKeyVaultName"] = req.product_teams_key_vault_name
+                    if req.new_secret_vault_name:
+                        fields["NewSecretVaultName"] = req.new_secret_vault_name
+                    if req.new_secret_key_id:
+                        fields["NewSecretKeyId"] = req.new_secret_key_id
+                elif status in DONE_STATUSES or status in REOPEN_STATUSES:
                     # Backfill only — never overwrites a value someone already
                     # set in SharePoint. Fires on BOTH In Progress and
                     # Resolved now (Resolved acts as a "second check" per
