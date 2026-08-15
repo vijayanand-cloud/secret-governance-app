@@ -873,6 +873,7 @@ async def api_run_monitoring():
         add_jira_comment              = add_jira_comment,
         send_teams_alert              = send_teams_alert,
         move_secret_to_ignored        = move_secret_to_ignored,
+        move_secret_from_ignored      = move_secret_from_ignored,  # NEW — Feature 2: Ignored -> master restore trigger
         create_ignored_row            = create_ignored_row,  # NEW — brand-new secret already 8+ days expired, straight to IgnoredSecretRegistry
         get_product_service_principal = get_product_service_principal,  # NEW — ProductName -> ManualAppOwners lookup
         fetch_app_owners              = fetch_app_owners,   # NEW — wires up real AppOwners population from Entra (was previously dead)
@@ -939,6 +940,10 @@ class JiraStatusUpdateReq(BaseModel):
     new_secret_vault_name:        Optional[str] = None
     new_secret_key_id:            Optional[str] = None
     new_secret_present:           Optional[str] = None  # "Yes"/"No" from Jira's NewSecretPresent field
+    # NEW — comments field paired with Jira's NewSecretUpdatedReferenceInventoryPresent
+    # Yes/No gate (Jira-only, not sent here — same pattern as new_secret_present
+    # above). Syncs to SharePoint's NewSecretUpdatedReferenceInventory column only.
+    new_secret_updated_reference_inventory: Optional[str] = None
     # NEW — set True by a separate "field value changed" Jira automation rule
     # (not the status-transition rule above), fired when an engineer edits
     # TeamName/ProductName/ProductTeamsKeyVaultName/NewSecretVaultName/
@@ -997,7 +1002,8 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
                    "product_teams_key_vault_name": "{{issue.customfield_10190.value}}",
                    "new_secret_vault_name":        "{{issue.customfield_10189}}",
                    "new_secret_key_id":            "{{issue.customfield_10188}}",
-                   "new_secret_present":           "{{issue.customfield_10187.value}}"
+                   "new_secret_present":           "{{issue.customfield_10191.value}}",
+                   "new_secret_updated_reference_inventory": "{{issue.customfield_10224}}"
                  }
         NOTE: {{now.format('yyyy-MM-dd')}} (single-quoted arg) has been seen
         to fail with "Unable to render smart values" in some Jira
@@ -1032,10 +1038,25 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
         the field arrives empty even though the ticket has one selected.
         NewSecretVaultName/NewSecretKeyId are plain free-text fields and
         must NOT get ".value" - they're already a string.
-        NOTE: there is also a customfield_10191 (NewSecretVaultPresent) on
-        this issue type now - a Jira-only Yes/No gate deciding whether
-        NewSecretVaultName is required, enforced entirely by Jira Automation
-        rules, not sent in this body since the backend has no use for it.
+        NOTE: there is also a customfield_10187 (NewSecretKeyIDPresent) and
+        customfield_10191 (NewSecretPresent) on this issue type - Jira-only
+        Yes/No gates deciding whether NewSecretKeyId/NewSecretVaultName are
+        required, enforced entirely by Jira Automation rules. NewSecretPresent
+        (10191) IS sent above as "new_secret_present" (used for the intake
+        acknowledgment comment below - it answers "is a new secret already
+        present in the vault", not "is a key ID present", so it must read
+        10191, not 10187 - a stale-ID bug caught and fixed here after the
+        NewSecretKeyIDPresent/NewSecretPresent field split).
+        NewSecretKeyIDPresent (10187) is not sent since the backend has no
+        use for it.
+        NOTE: customfield_10224 (NewSecretUpdatedReferenceInventory, a
+        paragraph/free-text field) and customfield_10225
+        (NewSecretUpdatedReferenceInventoryPresent, its Yes/No gate) were
+        added later. Only 10224 is sent here - same pattern as
+        NewSecretPresent/NewSecretVaultName: the gate stays Jira-only, only
+        the actual value syncs to SharePoint (into a column of the same
+        name, NewSecretUpdatedReferenceInventory - comments only, no
+        "Present" column exists in SharePoint by design).
 
     SharePoint AlertStatus mapping:
       Done                                        -> Rotated
@@ -1074,10 +1095,12 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
     log.info(
         "jira-status-update: RAW request received: jira_key=%r to_status=%r today=%r "
         "team_name=%r product_name=%r product_teams_key_vault_name=%r "
-        "new_secret_vault_name=%r new_secret_key_id=%r new_secret_present=%r",
+        "new_secret_vault_name=%r new_secret_key_id=%r new_secret_present=%r "
+        "new_secret_updated_reference_inventory=%r",
         req.jira_key, req.to_status, req.today, req.team_name, req.product_name,
         req.product_teams_key_vault_name, req.new_secret_vault_name,
         req.new_secret_key_id, req.new_secret_present,
+        req.new_secret_updated_reference_inventory,
     )
     today  = req.today
     status = req.to_status.strip().lower()
@@ -1175,6 +1198,7 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
                     "LoggedDate":        today,
                     "IgnoreReason":      f"Jira ticket {req.jira_key} canceled",
                     "JiraTicketKey":     req.jira_key,
+                    "AlertStatus":       "Ignored",
                 }
                 move_result = await move_secret_to_ignored(
                     item["id"], ignored_fields, f"Jira ticket {req.jira_key} canceled")
@@ -1220,6 +1244,8 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
                         fields["NewSecretVaultName"] = req.new_secret_vault_name
                     if req.new_secret_key_id:
                         fields["NewSecretKeyId"] = req.new_secret_key_id
+                    if req.new_secret_updated_reference_inventory:
+                        fields["NewSecretUpdatedReferenceInventory"] = req.new_secret_updated_reference_inventory
                 elif status in DONE_STATUSES or status in REOPEN_STATUSES:
                     # Backfill only — never overwrites a value someone already
                     # set in SharePoint. Fires on BOTH In Progress and
@@ -1241,6 +1267,8 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
                         fields["NewSecretVaultName"] = req.new_secret_vault_name
                     if not f.get("NewSecretKeyId") and req.new_secret_key_id:
                         fields["NewSecretKeyId"] = req.new_secret_key_id
+                    if not f.get("NewSecretUpdatedReferenceInventory") and req.new_secret_updated_reference_inventory:
+                        fields["NewSecretUpdatedReferenceInventory"] = req.new_secret_updated_reference_inventory
                     # NOTE: new_secret_present is deliberately NOT written to
                     # SharePoint - there's no column for it. It only exists
                     # to trigger the "scheduled for autorotation" Jira
