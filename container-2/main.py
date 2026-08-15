@@ -1251,7 +1251,12 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
                     if req.new_secret_key_id:
                         fields["NewSecretKeyId"] = req.new_secret_key_id
                     if req.new_secret_updated_reference_inventory:
-                        fields["NewSecretUpdatedReferenceInventory"] = req.new_secret_updated_reference_inventory
+                        # SharePoint truncated this column's internal REST name
+                        # to "NewSecretUpdatedReferenceInvento" (missing "ry")
+                        # at creation time - the display name in the UI is the
+                        # full "NewSecretUpdatedReferenceInventory", but Graph's
+                        # fields PATCH requires the actual internal name.
+                        fields["NewSecretUpdatedReferenceInvento"] = req.new_secret_updated_reference_inventory
                 elif status in DONE_STATUSES or status in REOPEN_STATUSES:
                     # Backfill only — never overwrites a value someone already
                     # set in SharePoint. Fires on BOTH In Progress and
@@ -1273,8 +1278,12 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
                         fields["NewSecretVaultName"] = req.new_secret_vault_name
                     if not f.get("NewSecretKeyId") and req.new_secret_key_id:
                         fields["NewSecretKeyId"] = req.new_secret_key_id
-                    if not f.get("NewSecretUpdatedReferenceInventory") and req.new_secret_updated_reference_inventory:
-                        fields["NewSecretUpdatedReferenceInventory"] = req.new_secret_updated_reference_inventory
+                    if not f.get("NewSecretUpdatedReferenceInvento") and req.new_secret_updated_reference_inventory:
+                        # See the NOTE above the overwrite branch's equivalent
+                        # line - "NewSecretUpdatedReferenceInvento" (no "ry")
+                        # is the real internal column name, truncated by
+                        # SharePoint at creation time.
+                        fields["NewSecretUpdatedReferenceInvento"] = req.new_secret_updated_reference_inventory
                     # NOTE: new_secret_present is deliberately NOT written to
                     # SharePoint - there's no column for it. It only exists
                     # to trigger the "scheduled for autorotation" Jira
