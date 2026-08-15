@@ -326,6 +326,13 @@ class JiraStatusUpdateReq(BaseModel):
     new_secret_vault_name:        Optional[str] = None
     new_secret_key_id:            Optional[str] = None
     new_secret_present:           Optional[str] = None
+    # NEW - added to Container 2's model for the field-edit-sync feature and
+    # the NewSecretUpdatedReferenceInventory field pair. Missing these here
+    # caused Container 2 to always see overwrite=False regardless of what
+    # Jira/the caller actually sent - the exact silent-drop failure mode
+    # this class's own comment above warns about.
+    new_secret_updated_reference_inventory: Optional[str] = None
+    overwrite: bool = False
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
  
