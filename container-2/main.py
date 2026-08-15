@@ -400,10 +400,16 @@ async def write_sharepoint_row(item_id: str | None, fields: dict[str, str]) -> d
     async with httpx.AsyncClient() as c:
         if item_id is None:
             r = await c.post(base, headers=headers, content=json.dumps({"fields": fields}), timeout=20)
+            if not r.is_success:
+                log.error("write_sharepoint_row: create failed (%s) fields=%r body=%s",
+                          r.status_code, fields, r.text)
             r.raise_for_status()
             return {"action": "created", "item_id": r.json().get("id"), "fields": fields}
         else:
             r = await c.patch(f"{base}/{item_id}", headers=headers, content=json.dumps({"fields": fields}), timeout=20)
+            if not r.is_success:
+                log.error("write_sharepoint_row: update failed (%s) item_id=%s fields=%r body=%s",
+                          r.status_code, item_id, fields, r.text)
             r.raise_for_status()
             return {"action": "updated", "item_id": item_id, "fields": fields}
  
