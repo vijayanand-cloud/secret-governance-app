@@ -9,6 +9,7 @@ import io
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional
  
@@ -924,6 +925,13 @@ async def api_update_on_jira_close(req: JiraCloseReq):
     log.info("update_on_jira_close: %s rows updated for %s", updated, req.jira_key)
     return {"updated": updated, "jira_key": req.jira_key}
  
+# An Azure AD passwordCredential keyId is always a GUID - anything else typed
+# into Jira's NewSecretKeyId field is a typo, not a real secret ID. Checked
+# before either write site below ever puts a value into SharePoint.
+_AZURE_SECRET_ID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
 class JiraStatusUpdateReq(BaseModel):
     jira_key:  str
     to_status: str   # Jira destination status name, exact text from the workflow
@@ -1248,8 +1256,21 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
                         fields["ProductTeamsKeyVaultName"] = req.product_teams_key_vault_name
                     if req.new_secret_vault_name:
                         fields["NewSecretVaultName"] = req.new_secret_vault_name
-                    if req.new_secret_key_id:
-                        fields["NewSecretKeyId"] = req.new_secret_key_id
+                    if req.new_secret_key_id is not None:
+                        candidate = req.new_secret_key_id.strip()
+                        if not candidate:
+                            # Explicit clear - engineer blanked the field back
+                            # out in Jira, so blank it in SharePoint too.
+                            fields["NewSecretKeyId"] = ""
+                        elif _AZURE_SECRET_ID_RE.match(candidate):
+                            fields["NewSecretKeyId"] = candidate
+                        else:
+                            log.warning(
+                                "jira-status-update: new_secret_key_id %r for %s is not a "
+                                "valid Azure secret ID (expected "
+                                "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx) - not writing to SharePoint",
+                                candidate, req.jira_key,
+                            )
                     if req.new_secret_updated_reference_inventory:
                         # SharePoint truncated this column's internal REST name
                         # to "NewSecretUpdatedReferenceInvento" (missing "ry")
@@ -1277,7 +1298,16 @@ async def api_jira_status_update(req: JiraStatusUpdateReq):
                     if not f.get("NewSecretVaultName") and req.new_secret_vault_name:
                         fields["NewSecretVaultName"] = req.new_secret_vault_name
                     if not f.get("NewSecretKeyId") and req.new_secret_key_id:
-                        fields["NewSecretKeyId"] = req.new_secret_key_id
+                        candidate = req.new_secret_key_id.strip()
+                        if _AZURE_SECRET_ID_RE.match(candidate):
+                            fields["NewSecretKeyId"] = candidate
+                        else:
+                            log.warning(
+                                "jira-status-update: new_secret_key_id %r for %s is not a "
+                                "valid Azure secret ID (expected "
+                                "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx) - not backfilling into SharePoint",
+                                candidate, req.jira_key,
+                            )
                     if not f.get("NewSecretUpdatedReferenceInvento") and req.new_secret_updated_reference_inventory:
                         # See the NOTE above the overwrite branch's equivalent
                         # line - "NewSecretUpdatedReferenceInvento" (no "ry")
