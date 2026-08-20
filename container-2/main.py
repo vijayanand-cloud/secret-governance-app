@@ -603,8 +603,13 @@ async def create_list_row(list_id: str, fields: dict) -> dict:
     async with httpx.AsyncClient() as c:
         r = await c.post(url, headers=headers, content=json.dumps({"fields": fields}), timeout=20)
         if not r.is_success:
-            log.error("create_list_row Graph error [%s] for list %s: %s",
-                      r.status_code, list_id, r.text[:2000])
+            # Row identity included so a failure is diagnosable from this one log
+            # line alone - without it, a batch failure only tells you the status
+            # code and Graph's error text, not which row triggered it.
+            log.error("create_list_row Graph error [%s] for list %s (SecretID=%s, "
+                      "AppName=%s, AlertStatus=%s): %s",
+                      r.status_code, list_id, fields.get("SecretID"), fields.get("AppName"),
+                      fields.get("AlertStatus"), r.text[:2000])
         r.raise_for_status()
         return {"item_id": r.json().get("id")}
 

@@ -492,32 +492,51 @@ async def _rotate_backup_list(
     # the rest of the backup. Batched the same way every other bulk write in
     # this file already is.
     async def _create_one(row: dict):
+        f = row.get("fields", {})
+        secret_id = f.get("SecretID")
+        app_name  = f.get("AppName")
         try:
-            fields = backup_list_row_fields(row.get("fields", {}))
+            fields = backup_list_row_fields(f)
             created = await create_list_row(backup_list_id, fields)
             return {"item_id": created["item_id"], "error": None}
         except Exception as e:
-            return {"item_id": None, "error": str(e)}
+            # Row identity captured here, not just the error string - create_list_row
+            # already logs Graph's own error text plus SecretID/AppName/AlertStatus,
+            # but that line alone doesn't say which of possibly many concurrent
+            # failures it corresponds to without this.
+            print(f"[ERROR] Backup rotation ({list_label}): row failed - "
+                  f"SecretID={secret_id!r} AppName={app_name!r}: {e}")
+            return {"item_id": None, "error": str(e), "secret_id": secret_id, "app_name": app_name}
 
     create_tasks   = [_create_one(row) for row in current_items]
     create_results = await _run_batched(create_tasks, SP_WRITE_BATCH)
 
     new_item_ids: list[str] = []
-    first_error = None
+    failed_rows: list[dict] = []
     for res in create_results:
         if isinstance(res, Exception):
-            first_error = first_error or str(res)
+            failed_rows.append({"secret_id": None, "app_name": None, "error": str(res)})
             continue
         if res.get("error"):
-            first_error = first_error or res["error"]
+            failed_rows.append({"secret_id": res.get("secret_id"), "app_name": res.get("app_name"),
+                                "error": res["error"]})
             continue
         new_item_ids.append(res["item_id"])
 
-    if first_error:
+    if failed_rows:
+        # NOTE: _run_batched() runs every batch regardless of earlier failures -
+        # "X/Y succeeded" is a final tally, not an early-stop point, so this no
+        # longer implies the run halted partway through. failed_rows can hold
+        # more than one row with more than one distinct error; the summary
+        # surfaces the first one for a quick read, the full list goes to the
+        # log for complete diagnosis without needing another run to reproduce it.
+        first = failed_rows[0]
         summary["errors"].append(
-            f"Backup rotation ({list_label}): snapshot write failed "
-            f"({len(new_item_ids)}/{len(current_items)} succeeded before the failure) - "
-            f"reverting: {first_error}")
+            f"Backup rotation ({list_label}): snapshot write failed - "
+            f"{len(new_item_ids)}/{len(current_items)} rows succeeded, "
+            f"{len(failed_rows)} failed, reverting. First failure: "
+            f"SecretID={first['secret_id']!r} AppName={first['app_name']!r}: {first['error']}")
+        print(f"[ERROR] Backup rotation ({list_label}): {len(failed_rows)} row(s) failed: {failed_rows}")
 
         async def _delete_one_revert(item_id: str):
             try:
