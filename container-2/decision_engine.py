@@ -646,6 +646,10 @@ async def run_secret_monitoring(
         "movedToIgnored": 0,           # abandoned secrets (-8+ days, no ticket or Canceled) moved to IgnoredSecretRegistry
         "newlyIgnored": 0,             # NEW - brand-new secrets already 8+ days expired, written straight to IgnoredSecretRegistry
         "alreadyIgnoredSkipped": 0,    # FIX - secrets already sitting in IgnoredSecretRegistry, correctly recognized and not re-added
+        "skippedAlreadyInIgnoredList": 0,  # NEW - secrets in ANY bucket (not just Ignore) already sitting in
+                                            # IgnoredSecretRegistry via a Canceled ticket or manual override,
+                                            # recognized before ticket/row creation instead of only within the
+                                            # Ignore-bucket-specific check above
         "manuallyIgnored":  0,   # NEW - rows manually set to AlertStatus=Ignored on the master list, moved to IgnoredSecretRegistry
         "manuallyRestored": 0,   # NEW - IgnoredSecretRegistry rows manually un-Ignored, moved back to the master list
         "masterListBackedUp": False,   # NEW - SecretAlertRegistry successfully snapshotted before this run touched it
@@ -1000,6 +1004,41 @@ async def run_secret_monitoring(
     # this function for why. Picked up as a normal "existing" row next run.
     if restored_secret_ids:
         new_secrets = [c for c in new_secrets if c["secret_id"] not in restored_secret_ids]
+
+    # NEW - skip re-creating a ticket/row for a secret that's already sitting
+    # in IgnoredSecretRegistry (via a Canceled ticket, or the manual
+    # AlertStatus=Ignored trigger on the master list) but isn't actually 8+
+    # days expired. Without this, such a secret has no row in sp_index (it
+    # only ever lived in SecretAlertRegistry, and was physically moved out),
+    # so on the very next run it looks indistinguishable from a genuinely
+    # brand-new secret - it gets classified into whatever active bucket its
+    # real expiration date lands in, and Phase 1/2 raise a fresh Jira ticket
+    # for it, silently undoing the human decision that put it in Ignored in
+    # the first place. Deliberately checked here, before the bucket split,
+    # so it covers every bucket - the existing alreadyIgnoredSkipped check
+    # further below only ever covered secrets landing in the Ignore bucket
+    # itself, not this case. A separate, independent read from Feature 2's
+    # own fetch above (not reused - that fetch is gated on
+    # move_secret_from_ignored being wired too, and this check should still
+    # run even if restore capability isn't configured).
+    if get_ignored_sharepoint_state is not None and new_secrets:
+        try:
+            ignored_state_for_dedup = await get_ignored_sharepoint_state()
+            ignored_secret_ids = {
+                item.get("fields", {}).get("SecretID", "")
+                for item in ignored_state_for_dedup.get("items", [])
+                if item.get("fields", {}).get("SecretID")
+            }
+        except Exception as e:
+            summary["errors"].append(
+                f"Could not read IgnoredSecretRegistry to de-duplicate new secrets already "
+                f"tracked there - proceeding without this de-duplication this run: {e}")
+            ignored_secret_ids = set()
+
+        if ignored_secret_ids:
+            before_count = len(new_secrets)
+            new_secrets = [c for c in new_secrets if c["secret_id"] not in ignored_secret_ids]
+            summary["skippedAlreadyInIgnoredList"] = before_count - len(new_secrets)
 
     # ── Lineage tracking 1 same secret, new version after rotation ───────────
     # When a secret rotates, rotation creates a brand-new Entra secret (new
