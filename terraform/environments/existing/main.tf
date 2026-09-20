@@ -13,7 +13,7 @@ provider "azurerm" {
 
 variable "location" { default = "South India" }
 variable "resource_group_name" { default = "Foundry-Project" }
-variable "key_vault_name" { default = "kv-secret-monitor" }
+variable "key_vault_name" { default = "kv-secret-monitor-0103" }
 
 resource "azurerm_resource_group" "rg" {
   name     = var.resource_group_name
@@ -42,7 +42,7 @@ data "azurerm_key_vault" "kv" {
 }
 
 data "azurerm_user_assigned_identity" "uami" {
-  name                = "uami-secret-governance"
+  name                = "uami-secret-monitor"
   resource_group_name = azurerm_resource_group.rg.name
 }
 
