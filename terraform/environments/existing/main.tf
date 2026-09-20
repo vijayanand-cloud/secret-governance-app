@@ -59,24 +59,4 @@ module "secret_governance" {
   # Existing Identity and Vault
   key_vault_url  = data.azurerm_key_vault.kv.vault_uri
   uami_client_id = data.azurerm_user_assigned_identity.uami.client_id
-
-  # Variables that must be provided via terraform.tfvars or env vars
-  openai_api_base              = var.openai_api_base
-  openai_api_key               = var.openai_api_key
-  openai_api_version           = var.openai_api_version
-  azure_openai_deployment_name = var.azure_openai_deployment_name
-}
-
-
-variable "openai_api_key" {
-  type      = string
-  sensitive = true
-}
-variable "openai_api_version" {
-  type    = string
-  default = "2023-05-15"
-}
-variable "azure_openai_deployment_name" {
-  type    = string
-  default = "gpt-4"
 }
