@@ -1,48 +1,35 @@
-terraform {
-  required_providers {
-    azurerm = {
-      source  = "hashicorp/azurerm"
-      version = "~> 3.0"
-    }
-  }
-}
-
-provider "azurerm" {
-  features {}
-}
-
-resource "azurerm_resource_group" "rg" {
-  name     = var.resource_group_name
-  location = var.location
-}
 
 resource "azurerm_container_registry" "acr" {
   name                = var.acr_name
-  resource_group_name = azurerm_resource_group.rg.name
-  location            = azurerm_resource_group.rg.location
+  resource_group_name = var.resource_group_name
+  location            = var.location
   sku                 = "Basic"
   admin_enabled       = true
 }
 
 resource "azurerm_log_analytics_workspace" "law" {
   name                = "law-${var.container_app_env_name}"
-  location            = azurerm_resource_group.rg.location
-  resource_group_name = azurerm_resource_group.rg.name
+  location            = var.location
+  resource_group_name = var.resource_group_name
   sku                 = "PerGB2018"
   retention_in_days   = 30
 }
 
 resource "azurerm_container_app_environment" "cae" {
   name                       = var.container_app_env_name
-  location                   = azurerm_resource_group.rg.location
-  resource_group_name        = azurerm_resource_group.rg.name
+  location                   = var.location
+  resource_group_name        = var.resource_group_name
   log_analytics_workspace_id = azurerm_log_analytics_workspace.law.id
+
+  # VNet Integration for Private Subnet
+  infrastructure_subnet_id       = var.infrastructure_subnet_id
+  internal_load_balancer_enabled = true
 }
 
 resource "azurerm_container_app" "app" {
   name                         = var.container_app_name
   container_app_environment_id = azurerm_container_app_environment.cae.id
-  resource_group_name          = azurerm_resource_group.rg.name
+  resource_group_name          = var.resource_group_name
   revision_mode                = "Single"
 
   template {
@@ -51,17 +38,53 @@ resource "azurerm_container_app" "app" {
       image  = "${azurerm_container_registry.acr.login_server}/secret-governance/langchain-agent:latest"
       cpu    = 0.5
       memory = "1.0Gi"
+
+      env {
+        name  = "OPENAI_API_BASE"
+        value = var.openai_api_base
+      }
+      env {
+        name  = "OPENAI_API_KEY"
+        secret_name = "openai-api-key"
+      }
+      env {
+        name  = "OPENAI_API_VERSION"
+        value = var.openai_api_version
+      }
+      env {
+        name  = "AZURE_OPENAI_DEPLOYMENT_NAME"
+        value = var.azure_openai_deployment_name
+      }
+      env {
+        name  = "MONITOR_API_BASE_URL"
+        value = var.monitor_api_base_url
+      }
     }
+
     container {
       name   = "monitor-mcp"
       image  = "${azurerm_container_registry.acr.login_server}/secret-governance/monitor-mcp:latest"
       cpu    = 0.5
       memory = "1.0Gi"
+
+      env {
+        name  = "KEY_VAULT_URL"
+        value = var.key_vault_url
+      }
+      env {
+        name  = "UAMI_CLIENT_ID"
+        value = var.uami_client_id
+      }
     }
   }
 
+  secret {
+    name  = "openai-api-key"
+    value = var.openai_api_key
+  }
+
   ingress {
-    external_enabled = true
+    external_enabled = false
     target_port      = 8000
     traffic_weight {
       percentage      = 100
