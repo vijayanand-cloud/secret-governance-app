@@ -40,24 +40,16 @@ resource "azurerm_container_app" "app" {
       memory = "1.0Gi"
 
       env {
-        name  = "OPENAI_API_BASE"
-        value = var.openai_api_base
+        name  = "KEY_VAULT_URL"
+        value = var.key_vault_url
       }
       env {
-        name  = "OPENAI_API_KEY"
-        secret_name = "openai-api-key"
+        name  = "UAMI_CLIENT_ID"
+        value = var.uami_client_id
       }
       env {
-        name  = "OPENAI_API_VERSION"
-        value = var.openai_api_version
-      }
-      env {
-        name  = "AZURE_OPENAI_DEPLOYMENT_NAME"
-        value = var.azure_openai_deployment_name
-      }
-      env {
-        name  = "MONITOR_API_BASE_URL"
-        value = var.monitor_api_base_url
+        name  = "MONITOR_MCP_URL"
+        value = "http://localhost:8001/mcp"
       }
     }
 
@@ -76,11 +68,6 @@ resource "azurerm_container_app" "app" {
         value = var.uami_client_id
       }
     }
-  }
-
-  secret {
-    name  = "openai-api-key"
-    value = var.openai_api_key
   }
 
   ingress {

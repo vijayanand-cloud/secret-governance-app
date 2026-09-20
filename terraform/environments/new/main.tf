@@ -141,8 +141,30 @@ module "secret_governance" {
   uami_client_id = azurerm_user_assigned_identity.uami.client_id
 
   # Azure OpenAI connection
-  openai_api_base              = azurerm_cognitive_account.openai.endpoint
-  openai_api_key               = azurerm_cognitive_account.openai.primary_access_key
-  openai_api_version           = "2023-05-15"
-  azure_openai_deployment_name = azurerm_cognitive_deployment.gpt4.name
+  
+  
+  
+  
 }
+
+resource "azurerm_key_vault_secret" "aoai_endpoint" {
+  name         = "AZURE-OPENAI-ENDPOINT"
+  value        = azurerm_cognitive_account.openai.endpoint
+  key_vault_id = azurerm_key_vault.kv.id
+  depends_on   = [azurerm_key_vault_access_policy.deployer_policy]
+}
+
+resource "azurerm_key_vault_secret" "aoai_key" {
+  name         = "AZURE-OPENAI-API-KEY"
+  value        = azurerm_cognitive_account.openai.primary_access_key
+  key_vault_id = azurerm_key_vault.kv.id
+  depends_on   = [azurerm_key_vault_access_policy.deployer_policy]
+}
+
+resource "azurerm_key_vault_secret" "aoai_deployment" {
+  name         = "AZURE-OPENAI-DEPLOYMENT-NAME"
+  value        = azurerm_cognitive_deployment.gpt4.name
+  key_vault_id = azurerm_key_vault.kv.id
+  depends_on   = [azurerm_key_vault_access_policy.deployer_policy]
+}
+

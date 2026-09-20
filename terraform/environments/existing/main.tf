@@ -67,7 +67,7 @@ module "secret_governance" {
   azure_openai_deployment_name = var.azure_openai_deployment_name
 }
 
-variable "openai_api_base" { type = string }
+
 variable "openai_api_key" {
   type      = string
   sensitive = true
