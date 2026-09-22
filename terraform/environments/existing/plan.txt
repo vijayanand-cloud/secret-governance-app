@@ -1,0 +1,487 @@
+azurerm_resource_group.rg: Preparing import... [id=/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project]
+azurerm_resource_group.rg: Refreshing state... [id=/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project]
+module.secret_governance.azurerm_container_registry.acr: Preparing import... [id=/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project/providers/Microsoft.ContainerRegistry/registries/acrsecretmonitor0103]
+data.azurerm_key_vault.kv: Reading...
+data.azurerm_user_assigned_identity.uami: Reading...
+module.secret_governance.azurerm_container_registry.acr: Refreshing state... [id=/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project/providers/Microsoft.ContainerRegistry/registries/acrsecretmonitor0103]
+module.secret_governance.azurerm_container_app_environment.cae: Preparing import... [id=/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project/providers/Microsoft.App/managedEnvironments/cae-secret-monitor]
+module.secret_governance.azurerm_container_app_environment.cae: Refreshing state... [id=/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project/providers/Microsoft.App/managedEnvironments/cae-secret-monitor]
+data.azurerm_user_assigned_identity.uami: Read complete after 0s [id=/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uami-secret-monitor]
+data.azurerm_key_vault.kv: Read complete after 1s [id=/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project/providers/Microsoft.KeyVault/vaults/kv-secret-monitor-0103]
+module.secret_governance.azurerm_container_app.app: Preparing import... [id=/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project/providers/Microsoft.App/containerApps/secret-governance-v2]
+module.secret_governance.azurerm_container_app.app: Refreshing state... [id=/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project/providers/Microsoft.App/containerApps/secret-governance-v2]
+
+Terraform used the selected providers to generate the following execution
+plan. Resource actions are indicated with the following symbols:
+  + create
+  ~ update in-place
+-/+ destroy and then create replacement
+
+Terraform will perform the following actions:
+
+  # azurerm_resource_group.rg will be imported
+    resource "azurerm_resource_group" "rg" {
+        id         = "/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project"
+        location   = "southindia"
+        managed_by = null
+        name       = "Foundry-Project"
+        tags       = {}
+    }
+
+  # azurerm_subnet.snet will be created
+  + resource "azurerm_subnet" "snet" {
+      + address_prefixes                               = [
+          + "10.0.0.0/23",
+        ]
+      + default_outbound_access_enabled                = true
+      + enforce_private_link_endpoint_network_policies = (known after apply)
+      + enforce_private_link_service_network_policies  = (known after apply)
+      + id                                             = (known after apply)
+      + name                                           = "snet-containerapps"
+      + private_endpoint_network_policies              = (known after apply)
+      + private_endpoint_network_policies_enabled      = (known after apply)
+      + private_link_service_network_policies_enabled  = (known after apply)
+      + resource_group_name                            = "Foundry-Project"
+      + virtual_network_name                           = "vnet-secret-governance"
+    }
+
+  # azurerm_virtual_network.vnet will be created
+  + resource "azurerm_virtual_network" "vnet" {
+      + address_space       = [
+          + "10.0.0.0/16",
+        ]
+      + dns_servers         = (known after apply)
+      + guid                = (known after apply)
+      + id                  = (known after apply)
+      + location            = "southindia"
+      + name                = "vnet-secret-governance"
+      + resource_group_name = "Foundry-Project"
+      + subnet              = (known after apply)
+    }
+
+  # module.secret_governance.azurerm_container_app.app must be replaced
+  # (imported from "/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project/providers/Microsoft.App/containerApps/secret-governance-v2")
+  # Warning: this will destroy the imported resource
+-/+ resource "azurerm_container_app" "app" {
+      ~ container_app_environment_id  = "/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project/providers/Microsoft.App/managedEnvironments/cae-secret-monitor" -> (known after apply) # forces replacement
+      ~ custom_domain_verification_id = (sensitive value)
+      ~ id                            = "/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project/providers/Microsoft.App/containerApps/secret-governance-v2" -> (known after apply)
+      ~ latest_revision_fqdn          = "secret-governance-v2--0000092.whitebeach-12a8e3b9.southindia.azurecontainerapps.io" -> (known after apply)
+      ~ latest_revision_name          = "secret-governance-v2--0000092" -> (known after apply)
+      ~ location                      = "southindia" -> (known after apply)
+        name                          = "secret-governance-v2"
+      ~ outbound_ip_addresses         = [
+          - "52.140.42.78",
+          - "52.140.42.103",
+          - "52.140.18.104",
+          - "52.140.3.4",
+          - "52.172.102.92",
+          - "52.140.23.196",
+          - "52.140.18.199",
+          - "52.140.20.52",
+          - "52.140.46.157",
+          - "52.140.5.50",
+          - "20.235.50.215",
+          - "52.140.54.138",
+          - "104.211.204.51",
+          - "20.235.154.148",
+          - "104.211.204.70",
+          - "20.235.25.189",
+          - "52.140.55.214",
+          - "104.211.201.14",
+          - "52.140.55.215",
+          - "52.140.55.190",
+          - "20.235.54.190",
+          - "20.41.237.27",
+          - "20.235.29.5",
+          - "74.224.121.57",
+          - "52.140.56.247",
+          - "20.235.54.142",
+          - "20.235.131.59",
+          - "20.235.28.97",
+          - "20.235.54.155",
+          - "20.235.34.48",
+          - "20.235.28.90",
+          - "104.211.201.11",
+          - "20.235.28.244",
+          - "20.41.237.84",
+          - "20.41.236.22",
+          - "20.235.177.10",
+          - "20.235.29.52",
+          - "20.235.28.91",
+          - "20.235.28.100",
+          - "20.235.54.148",
+          - "20.235.44.212",
+          - "20.219.70.144",
+          - "20.235.155.19",
+          - "20.235.131.60",
+          - "104.211.201.15",
+          - "20.235.34.78",
+          - "20.235.141.43",
+          - "20.235.54.20",
+          - "20.235.29.53",
+          - "52.140.55.199",
+          - "20.219.70.236",
+          - "20.219.89.64",
+          - "104.211.201.157",
+          - "74.224.122.65",
+          - "20.41.236.20",
+          - "104.211.213.156",
+          - "20.41.236.23",
+          - "20.235.28.245",
+          - "20.235.54.153",
+          - "20.235.34.75",
+          - "74.224.121.141",
+          - "20.235.28.96",
+          - "74.224.122.64",
+          - "104.211.201.10",
+          - "52.140.55.198",
+          - "20.235.181.45",
+          - "20.235.54.202",
+          - "20.235.32.28",
+          - "20.235.54.120",
+          - "20.235.130.3",
+          - "20.235.131.29",
+          - "20.235.34.74",
+          - "4.247.31.11",
+          - "20.235.28.101",
+          - "20.235.54.146",
+          - "52.140.55.191",
+          - "20.235.54.199",
+          - "20.235.54.2",
+          - "20.235.29.4",
+          - "20.235.142.42",
+          - "20.235.177.223",
+          - "74.225.9.237",
+          - "74.225.2.86",
+          - "20.235.178.6",
+          - "20.235.178.92",
+          - "4.247.28.84",
+          - "4.247.27.225",
+          - "74.225.9.225",
+          - "4.247.26.252",
+          - "4.247.28.113",
+          - "52.140.55.180",
+          - "20.41.249.100",
+          - "20.41.250.179",
+          - "52.140.56.215",
+          - "20.41.251.190",
+          - "20.219.107.107",
+          - "52.172.90.85",
+          - "20.219.100.218",
+          - "20.219.100.159",
+          - "52.140.49.178",
+          - "52.140.16.129",
+          - "52.140.7.58",
+          - "52.140.32.99",
+          - "52.140.47.149",
+          - "52.172.101.43",
+          - "13.71.122.125",
+          - "52.172.99.132",
+          - "52.172.100.96",
+          - "52.140.7.136",
+          - "52.172.97.66",
+          - "20.41.216.141",
+          - "20.219.75.76",
+          - "20.219.123.9",
+          - "52.172.94.105",
+          - "20.219.110.218",
+          - "20.219.122.210",
+          - "20.235.1.74",
+          - "20.41.253.186",
+          - "20.219.82.170",
+          - "52.140.62.197",
+          - "20.235.160.18",
+          - "20.219.75.75",
+          - "52.172.95.177",
+          - "20.219.82.171",
+          - "20.41.250.33",
+          - "20.41.219.209",
+          - "20.219.82.223",
+          - "20.219.74.255",
+          - "20.235.1.75",
+          - "20.235.47.149",
+          - "20.219.75.65",
+          - "20.41.254.45",
+          - "20.219.123.8",
+          - "20.44.62.69",
+          - "20.219.75.94",
+          - "20.219.122.243",
+          - "20.219.82.228",
+          - "20.219.122.238",
+          - "20.219.82.238",
+          - "20.219.82.239",
+          - "20.219.123.31",
+          - "20.235.28.36",
+          - "20.219.75.56",
+          - "20.219.75.74",
+          - "20.235.28.27",
+          - "20.219.123.30",
+          - "52.140.55.181",
+          - "20.219.82.250",
+          - "20.41.253.240",
+          - "20.219.82.222",
+          - "20.235.0.179",
+          - "20.219.82.229",
+          - "20.235.40.60",
+          - "20.235.28.64",
+          - "20.44.62.77",
+          - "20.219.83.128",
+          - "20.41.250.32",
+          - "20.219.122.254",
+          - "52.172.89.88",
+          - "20.219.122.242",
+          - "20.235.40.61",
+          - "20.219.75.77",
+          - "20.235.26.237",
+          - "20.235.18.227",
+          - "20.41.221.150",
+          - "20.219.122.255",
+          - "20.235.28.37",
+          - "20.235.29.173",
+          - "20.219.120.65",
+          - "20.41.219.3",
+          - "20.41.221.3",
+          - "20.235.18.53",
+          - "20.235.28.26",
+          - "20.235.1.175",
+          - "20.41.253.169",
+          - "20.219.75.57",
+          - "52.172.95.172",
+          - "20.219.75.64",
+          - "20.219.122.239",
+          - "20.41.253.138",
+          - "104.211.222.34",
+        ] -> (known after apply)
+        resource_group_name           = "Foundry-Project"
+        revision_mode                 = "Single"
+      - tags                          = {} -> null
+      - workload_profile_name         = "Consumption" -> null
+
+      - identity {
+          - identity_ids = [
+              - "/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uami-secret-monitor",
+            ] -> null
+            principal_id = null
+            tenant_id    = null
+          - type         = "UserAssigned" -> null
+        }
+
+      ~ ingress {
+            allow_insecure_connections = false
+          - exposed_port               = 0 -> null
+          ~ external_enabled           = true -> false
+          ~ fqdn                       = "secret-governance-v2.whitebeach-12a8e3b9.southindia.azurecontainerapps.io" -> (known after apply)
+            target_port                = 8000
+          ~ transport                  = "http" -> "auto"
+
+          ~ custom_domain (known after apply)
+
+            traffic_weight {
+                label           = null
+                latest_revision = true
+                percentage      = 100
+                revision_suffix = null
+            }
+        }
+
+      - registry {
+          - identity             = "/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project/providers/Microsoft.ManagedIdentity/userAssignedIdentities/uami-secret-monitor" -> null
+            password_secret_name = null
+          - server               = "acrsecretmonitor0103.azurecr.io" -> null
+            username             = null
+        }
+
+      ~ template {
+          ~ max_replicas    = 1 -> 10
+            min_replicas    = 0
+          + revision_suffix = (known after apply)
+
+          ~ container {
+              - args              = [] -> null
+              - command           = [] -> null
+                cpu               = 0.5
+              ~ ephemeral_storage = "2Gi" -> (known after apply)
+              ~ image             = "acrsecretmonitor0103.azurecr.io/secret-governance/langchain-agent:0289679fecc37ec30a52ec3cb7003493223a6bfa" -> "acrsecretmonitor0103.azurecr.io/secret-governance/langchain-agent:latest"
+              ~ memory            = "1Gi" -> "1.0Gi"
+                name              = "langchain-agent"
+
+                env {
+                    name        = "KEY_VAULT_URL"
+                    secret_name = null
+                    value       = "https://kv-secret-monitor-0103.vault.azure.net/"
+                }
+                env {
+                    name        = "UAMI_CLIENT_ID"
+                    secret_name = null
+                    value       = "17c0380e-395b-4b6b-bebb-bfd1dc439530"
+                }
+                env {
+                    name        = "MONITOR_MCP_URL"
+                    secret_name = null
+                    value       = "http://localhost:8001/mcp"
+                }
+
+              - liveness_probe {
+                  - failure_count_threshold          = 0 -> null
+                    host                             = null
+                  - initial_delay                    = 15 -> null
+                  - interval_seconds                 = 30 -> null
+                  - path                             = "/health" -> null
+                  - port                             = 8000 -> null
+                  - termination_grace_period_seconds = 0 -> null
+                  - timeout                          = 0 -> null
+                    transport                        = null
+                }
+
+              - readiness_probe {
+                  - failure_count_threshold = 0 -> null
+                    host                    = null
+                  - interval_seconds        = 15 -> null
+                  - path                    = "/health" -> null
+                  - port                    = 8000 -> null
+                  - success_count_threshold = 0 -> null
+                  - timeout                 = 0 -> null
+                    transport               = null
+                }
+            }
+          ~ container {
+              - args              = [] -> null
+              - command           = [] -> null
+                cpu               = 0.5
+              ~ ephemeral_storage = "2Gi" -> (known after apply)
+              ~ image             = "acrsecretmonitor0103.azurecr.io/secret-governance/monitor-mcp:6328e3ab329963128a10ee32d5fec07d8e0cb0d2" -> "acrsecretmonitor0103.azurecr.io/secret-governance/monitor-mcp:latest"
+              ~ memory            = "1Gi" -> "1.0Gi"
+                name              = "monitor-mcp"
+
+                env {
+                    name        = "KEY_VAULT_URL"
+                    secret_name = null
+                    value       = "https://kv-secret-monitor-0103.vault.azure.net/"
+                }
+                env {
+                    name        = "UAMI_CLIENT_ID"
+                    secret_name = null
+                    value       = "17c0380e-395b-4b6b-bebb-bfd1dc439530"
+                }
+
+              - liveness_probe {
+                  - failure_count_threshold          = 0 -> null
+                    host                             = null
+                  - initial_delay                    = 15 -> null
+                  - interval_seconds                 = 30 -> null
+                  - path                             = "/health" -> null
+                  - port                             = 8001 -> null
+                  - termination_grace_period_seconds = 0 -> null
+                  - timeout                          = 0 -> null
+                    transport                        = null
+                }
+
+              - readiness_probe {
+                  - failure_count_threshold = 0 -> null
+                    host                    = null
+                  - interval_seconds        = 15 -> null
+                  - path                    = "/health" -> null
+                  - port                    = 8001 -> null
+                  - success_count_threshold = 0 -> null
+                  - timeout                 = 0 -> null
+                    transport               = null
+                }
+            }
+
+          - http_scale_rule {
+              - concurrent_requests = "10" -> null
+              - name                = "http-scaler" -> null
+            }
+        }
+    }
+
+  # module.secret_governance.azurerm_container_app_environment.cae must be replaced
+  # (imported from "/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project/providers/Microsoft.App/managedEnvironments/cae-secret-monitor")
+  # Warning: this will destroy the imported resource
+-/+ resource "azurerm_container_app_environment" "cae" {
+      ~ custom_domain_verification_id               = "F63DEFDF9EB71366A00FD2DA029ED12E592FF7BD63A415816889752213D9CE82" -> (known after apply)
+        dapr_application_insights_connection_string = (sensitive value)
+      ~ default_domain                              = "whitebeach-12a8e3b9.southindia.azurecontainerapps.io" -> (known after apply)
+      + docker_bridge_cidr                          = (known after apply)
+      ~ id                                          = "/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project/providers/Microsoft.App/managedEnvironments/cae-secret-monitor" -> (known after apply)
+        infrastructure_resource_group_name          = null
+      + infrastructure_subnet_id                    = (known after apply) # forces replacement
+      ~ internal_load_balancer_enabled              = false -> true # forces replacement
+        location                                    = "southindia"
+      + log_analytics_workspace_id                  = (known after apply) # forces replacement
+        mutual_tls_enabled                          = false
+        name                                        = "cae-secret-monitor"
+      + platform_reserved_cidr                      = (known after apply)
+      + platform_reserved_dns_ip_address            = (known after apply)
+        resource_group_name                         = "Foundry-Project"
+      ~ static_ip_address                           = "20.41.242.243" -> (known after apply)
+      - tags                                        = {} -> null
+        zone_redundancy_enabled                     = false
+    }
+
+  # module.secret_governance.azurerm_container_registry.acr will be updated in-place
+  # (imported from "/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project/providers/Microsoft.ContainerRegistry/registries/acrsecretmonitor0103")
+  ~ resource "azurerm_container_registry" "acr" {
+      ~ admin_enabled                 = false -> true
+        admin_password                = (sensitive value)
+        admin_username                = null
+        anonymous_pull_enabled        = false
+        data_endpoint_enabled         = false
+        encryption                    = [
+            {
+                enabled            = false
+                identity_client_id = null
+                key_vault_key_id   = null
+            },
+        ]
+        export_policy_enabled         = true
+        id                            = "/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project/providers/Microsoft.ContainerRegistry/registries/acrsecretmonitor0103"
+        location                      = "southindia"
+        login_server                  = "acrsecretmonitor0103.azurecr.io"
+        name                          = "acrsecretmonitor0103"
+        network_rule_bypass_option    = "AzureServices"
+        network_rule_set              = []
+        public_network_access_enabled = true
+        quarantine_policy_enabled     = false
+        resource_group_name           = "Foundry-Project"
+        retention_policy              = [
+            {
+                days    = 7
+                enabled = false
+            },
+        ]
+        sku                           = "Basic"
+        tags                          = {}
+        trust_policy                  = [
+            {
+                enabled = false
+            },
+        ]
+        zone_redundancy_enabled       = false
+    }
+
+  # module.secret_governance.azurerm_log_analytics_workspace.law will be created
+  + resource "azurerm_log_analytics_workspace" "law" {
+      + allow_resource_only_permissions = true
+      + daily_quota_gb                  = -1
+      + id                              = (known after apply)
+      + internet_ingestion_enabled      = true
+      + internet_query_enabled          = true
+      + local_authentication_disabled   = false
+      + location                        = "southindia"
+      + name                            = "law-cae-secret-monitor"
+      + primary_shared_key              = (sensitive value)
+      + resource_group_name             = "Foundry-Project"
+      + retention_in_days               = 30
+      + secondary_shared_key            = (sensitive value)
+      + sku                             = "PerGB2018"
+      + workspace_id                    = (known after apply)
+    }
+
+Plan: 4 to import, 5 to add, 1 to change, 2 to destroy.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Note: You didn't use the -out option to save this plan, so Terraform can't
+guarantee to take exactly these actions if you run "terraform apply" now.

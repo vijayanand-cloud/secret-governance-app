@@ -746,8 +746,8 @@ async def move_secret_from_ignored(item_id: str, fields: dict[str, str], reason:
 
 async def create_jira_ticket(app_name: str, app_id: str, secret_id: str, secret_description: str, expiration_date: str, days_remaining: int, severity: str = "WARNING", priority: str = "High", extra_note: str = "") -> dict:
     days_text = f"EXPIRED {abs(days_remaining)} days ago" if days_remaining < 0 else f"{days_remaining} days remaining"
-    summary_line = f"[{severity}] Azure Secret Expiry - {app_name} - {days_text}"
-    text = (f"App Registration Name: {app_name}\nApp ID: {app_id}\nSecret ID: {secret_id}\nSecret Description: {secret_description}\nDays Remaining: {days_text}\nSeverity: {severity}\n")
+    summary_line = f"[{severity}] Azure Secret Expiry - {app_name}"
+    text = (f"App Registration Name: {app_name}\nApp ID: {app_id}\nSecret ID: {secret_id}\nSecret Description: {secret_description}\nSeverity: {severity}\n")
     if extra_note: text += f"\nNote: {extra_note}"
     payload = {"fields": {"project": {"key": JIRA_PROJECT_KEY}, "summary": summary_line, "description": text, "issuetype": {"name": JIRA_ISSUE_TYPE}, "priority": {"name": priority}, "labels": ["azure-secret", "rotation-required"], "duedate": expiration_date[:10]}}
     if JIRA_EPIC_KEY and JIRA_EPIC_KEY != "CSD-123": payload["fields"]["parent"] = {"key": JIRA_EPIC_KEY}

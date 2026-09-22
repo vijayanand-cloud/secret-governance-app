@@ -68,22 +68,11 @@ module "secret_governance" {
   uami_client_id = data.azurerm_user_assigned_identity.uami.client_id
 }
 
-import {
-  to = module.secret_governance.azurerm_container_registry.acr
-  id = "/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project/providers/Microsoft.ContainerRegistry/registries/acrsecretmonitor0103"
-}
-import {
-  to = module.secret_governance.azurerm_container_app_environment.cae
-  id = "/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project/providers/Microsoft.App/managedEnvironments/cae-secret-monitor"
-}
-import {
-  to = module.secret_governance.azurerm_container_app.app
-  id = "/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project/providers/Microsoft.App/containerApps/secret-governance-v2"
-}
 
 
-import {
-  to = azurerm_resource_group.rg
-  id = "/subscriptions/8d9c148a-455c-4c34-8ccc-045b0394798a/resourceGroups/Foundry-Project"
-}
+
+
+
+
+
 
