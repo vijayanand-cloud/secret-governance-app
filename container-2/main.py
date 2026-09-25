@@ -157,7 +157,12 @@ try:
     JIRA_ISSUE_TYPE = _kv_get("JIRA-ISSUE-TYPE").strip()
 except Exception:
     JIRA_ISSUE_TYPE = "Email request"
- 
+
+# Set this to your Jira custom description field ID (e.g. "customfield_10258")
+# if your Jira project uses a custom field instead of the built-in system description.
+# Set to None for standard projects using the built-in system description field.
+JIRA_DESCRIPTION_CUSTOM_FIELD_ID = "customfield_10258"
+
 log.info(f"Config loaded. Project: {JIRA_PROJECT_KEY} | Epic: {JIRA_EPIC_KEY}")
  
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -750,6 +755,8 @@ async def create_jira_ticket(app_name: str, app_id: str, secret_id: str, secret_
     text = (f"App Registration Name: {app_name}\nApp ID: {app_id}\nSecret ID: {secret_id}\nSecret Description: {secret_description}\nSeverity: {severity}\n")
     if extra_note: text += f"\nNote: {extra_note}"
     payload = {"fields": {"project": {"key": JIRA_PROJECT_KEY}, "summary": summary_line, "description": text, "issuetype": {"name": JIRA_ISSUE_TYPE}, "priority": {"name": priority}, "labels": ["azure-secret", "rotation-required"], "duedate": expiration_date[:10]}}
+    if JIRA_DESCRIPTION_CUSTOM_FIELD_ID:
+        payload["fields"][JIRA_DESCRIPTION_CUSTOM_FIELD_ID] = text
     if JIRA_EPIC_KEY and JIRA_EPIC_KEY != "CSD-123": payload["fields"]["parent"] = {"key": JIRA_EPIC_KEY}
     async with httpx.AsyncClient() as c:
         r = await c.post(f"{JIRA_BASE_URL}/rest/api/2/issue", headers={"Authorization": _jira_auth(), "Content-Type": "application/json"}, content=json.dumps(payload), timeout=20)
