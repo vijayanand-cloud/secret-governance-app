@@ -99,10 +99,106 @@ Changes in this version:
 from __future__ import annotations
  
 import asyncio
+import fnmatch
+import os
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Callable, Awaitable
- 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DYNAMIC PATTERN ANALYSIS (JIRA TICKET BYPASS)
+# ─────────────────────────────────────────────────────────────────────────────
+# Patterns configured to bypass Jira ticket creation while preserving all other
+# governance operations (SharePoint logging, bucket classification, Teams alerts).
+# Supports glob wildcards (*, ?) and direct substring matching.
+DEFAULT_BYPASS_JIRA_PATTERNS = [
+    "*.select*",          # Pattern 1: Secrets whose display name contains '.select'
+    "practice-plus-*",    # Pattern 2: Secrets whose display name matches 'practice-plus-*'
+    "*-partner-*",        # Pattern 3: Secrets whose display name matches '*-partner-*'
+    "*-internal-*",       # Pattern 4: Internal microservice credentials
+    "svc-automation-*",   # Pattern 5: Automated service worker credentials
+    "temp-*",             # Pattern 6: Ephemeral and temporary migration credentials
+]
+
+# Second Tenant ID where pattern-based Jira bypass strictly applies
+DEFAULT_PATTERN_BYPASS_TENANTS = [
+    "c721d616-dcf3-4510-9c3e-548bc6c1f628",  # Second Tenant
+]
+
+def matches_bypass_jira_pattern(display_name: str, patterns: list[str] | None = None) -> bool:
+    """
+    Checks if a secret's display name matches any configured bypass pattern.
+    Supports glob wildcards (*, ?) and direct substring matching.
+    Can be dynamically extended via patterns parameter or BYPASS_JIRA_PATTERNS env var.
+    """
+    if not display_name or display_name in ("N/A", "None", ""):
+        return False
+    name = display_name.strip().lower()
+
+    if patterns is None:
+        env_patterns = os.environ.get("BYPASS_JIRA_PATTERNS")
+        if env_patterns:
+            patterns = [p.strip() for p in env_patterns.split(",") if p.strip()]
+        else:
+            patterns = DEFAULT_BYPASS_JIRA_PATTERNS
+
+    for pat in patterns:
+        pat_clean = pat.strip().lower()
+        if fnmatch.fnmatchcase(name, pat_clean):
+            return True
+        if "*" not in pat_clean and "?" not in pat_clean and pat_clean in name:
+            return True
+    return False
+
+def should_bypass_jira_for_secret(
+    c: dict,
+    patterns: list[str] | None = None,
+    target_tenants: list[str] | None = None
+) -> bool:
+    """
+    Checks if a secret candidate should bypass Jira ticket creation.
+    STRICT RULES:
+      1. Secret MUST originate from the Second Tenant (c721d616-dcf3-4510-9c3e-548bc6c1f628).
+         Secrets in the Primary Tenant are NEVER bypassed (always follow standard Jira flow).
+      2. Secret display name must match configured patterns (.select, practice-plus-*).
+    Both conditions must be met to bypass Jira.
+    """
+    if not isinstance(c, dict):
+        return False
+
+    tenant_id = (
+        c.get("tenant_id")
+        or c.get("TenantID")
+        or c.get("_sourceTenantId")
+        or c.get("tenantId")
+        or ""
+    ).strip().lower()
+
+    # Resolve target tenants (dynamic: parameter -> env var -> default)
+    if target_tenants is None:
+        env_tenants = os.environ.get("BYPASS_JIRA_TENANT_IDS") or os.environ.get("PATTERN_BYPASS_TENANTS")
+        if env_tenants:
+            target_tenants = [t.strip().lower() for t in env_tenants.split(",") if t.strip()]
+        else:
+            target_tenants = [t.lower() for t in DEFAULT_PATTERN_BYPASS_TENANTS]
+    else:
+        target_tenants = [t.lower() for t in target_tenants]
+
+    # Rule 1: MUST belong to the targeted Second Tenant
+    if not tenant_id or tenant_id not in target_tenants:
+        return False
+
+    # Rule 2: MUST match display name pattern
+    display_name = (
+        c.get("secret_desc")
+        or c.get("secret_display_name")
+        or c.get("display_name")
+        or c.get("SecretDescription")
+        or c.get("AppName")
+        or ""
+    )
+    return matches_bypass_jira_pattern(display_name, patterns)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # BATCH SETTINGS 1 tune here if throttling occurs
 # ─────────────────────────────────────────────────────────────────────────────
@@ -359,7 +455,7 @@ def _build_candidates(applications: list[dict], now: datetime) -> tuple[list[dic
         # pattern). Falls back to "" if somehow absent, so a caller that
         # doesn't set this doesn't crash 1 write_sharepoint_row's own
         # fallback to GRAPH_TENANT_ID takes over in that case.
-        source_tenant_id = app.get("_sourceTenantId", "")
+        source_tenant_id = app.get("_sourceTenantId") or app.get("tenant_id") or app.get("tenantId") or ""
         for cred in creds:
             end_dt_str = cred.get("endDateTime")
             if not end_dt_str:
@@ -376,6 +472,7 @@ def _build_candidates(applications: list[dict], now: datetime) -> tuple[list[dic
                 "app_name":    app_name,
                 "secret_id":   cred.get("keyId"),
                 "secret_desc": cred.get("displayName") or "N/A",
+                "secret_display_name": cred.get("displayName") or "",
                 "expiration":  _format_datetime_est(exp),  # EST 12hr string, matches discovery
                 "days":        days,
                 "bucket":      classify_bucket(days),
@@ -624,6 +721,8 @@ async def run_secret_monitoring(
     create_list_row:            Callable[[str, dict], Awaitable[dict]] | None = None,
     delete_list_row:            Callable[[str, str], Awaitable[dict]] | None = None,
     upload_backup_to_storage:   Callable[[str, list], Awaitable[dict]] | None = None,
+    bypass_jira_patterns:       list[str] | None = None,  # Dynamic patterns where Jira ticket creation is skipped
+    bypass_jira_tenants:        list[str] | None = None,  # Dynamic target tenants for Jira bypass (defaults to second tenant)
 ) -> dict:
     now   = datetime.now(timezone.utc)
     today = _now_est_string()  # full EST timestamp, matches runbook_discovery.py
@@ -635,6 +734,7 @@ async def run_secret_monitoring(
         "p4LoggedOnly":    0,   # P4 secrets (61+ days, safe) 1 logged only, no SharePoint entry
         "skippedNotOwned": 0,   # secrets skipped 1 app not owned by owner_email
         "newJiraTickets":  0,
+        "jiraBypassedPatternCount": 0,  # Count of secrets where Jira creation was skipped via pattern match
         "newTeamsAlerts":  0,
         "jiraComments":    0,
         "sharepointCreated": 0,
@@ -1100,8 +1200,24 @@ async def run_secret_monitoring(
     ]
 
  
-    jira_bound_new = [c for c in actionable_new if c["bucket"] in JIRA_TICKET_BUCKETS]
-    teams_only_new = [c for c in actionable_new if c["bucket"] not in JIRA_TICKET_BUCKETS]
+    # DYNAMIC PATTERN ANALYSIS: Bypass Jira ticket creation if secret display name matches pattern AND is on target tenant
+    jira_bound_new = [
+        c for c in actionable_new
+        if c["bucket"] in JIRA_TICKET_BUCKETS and not should_bypass_jira_for_secret(c, bypass_jira_patterns, bypass_jira_tenants)
+    ]
+    teams_only_new = [
+        c for c in actionable_new
+        if c["bucket"] not in JIRA_TICKET_BUCKETS or should_bypass_jira_for_secret(c, bypass_jira_patterns, bypass_jira_tenants)
+    ]
+
+    # Track how many new secrets bypassed Jira due to pattern matching on target tenant
+    bypassed_new_count = sum(
+        1 for c in actionable_new
+        if c["bucket"] in JIRA_TICKET_BUCKETS and should_bypass_jira_for_secret(c, bypass_jira_patterns, bypass_jira_tenants)
+    )
+    summary["jiraBypassedPatternCount"] += bypassed_new_count
+    if bypassed_new_count > 0:
+        print(f"[PATTERN ANALYSIS] {bypassed_new_count} secret(s) matched Jira bypass pattern (.select / practice-plus-*) on target tenant -> Jira ticket creation bypassed.")
  
     async def _create_ticket_for_new(c: dict):
         sev   = SEVERITY_MAP[c["bucket"]]
@@ -1430,6 +1546,8 @@ async def run_secret_monitoring(
                 write_sharepoint_row, create_jira_ticket,
                 get_jira_issue, add_jira_comment, send_teams_alert,
                 teams_tag_email, move_secret_to_ignored,
+                bypass_jira_patterns=bypass_jira_patterns,
+                bypass_jira_tenants=bypass_jira_tenants,
             )
             return result
         except Exception as e:
@@ -1477,6 +1595,8 @@ async def _handle_existing_secret(
     write_sharepoint_row, create_jira_ticket, get_jira_issue,
     add_jira_comment, send_teams_alert, teams_tag_email: str = "",
     move_secret_to_ignored=None,
+    bypass_jira_patterns: list[str] | None = None,
+    bypass_jira_tenants: list[str] | None = None,
 ) -> dict:
     f            = existing.get("fields", {})
     item_id      = existing.get("id")
@@ -1711,12 +1831,11 @@ async def _handle_existing_secret(
     # for existing rows. See the FIX note above actionable_new for the full
     # reasoning (explicit requirement: tickets/alerts fire on severity alone).
 
-    # Self-heal missing Jira ticket 1 now applies to EVERY bucket that
-    # should have one: P1, P2, P3, P4, ExpiredManualReview. Previously this
-    # only fired for P3/P4/ExpiredManualReview, matching the old (wrong)
-    # JIRA_TICKET_BUCKETS 1 now that P1/P2 are included, a P1/P2 row that
-    # somehow lost/never got its ticket is self-healed here too.
-    if not jira_key and bucket in JIRA_TICKET_BUCKETS and bucket in SEVERITY_MAP:
+    # Pattern bypass check: secrets matching pattern (.select, practice-plus-*) in target tenant bypass Jira tickets
+    should_bypass_jira = should_bypass_jira_for_secret(c, bypass_jira_patterns, bypass_jira_tenants)
+
+    # Self-heal missing Jira ticket — applies to ticket-eligible buckets unless matching bypass pattern
+    if not jira_key and bucket in JIRA_TICKET_BUCKETS and bucket in SEVERITY_MAP and not should_bypass_jira:
         sev   = SEVERITY_MAP[bucket]
         issue = await create_jira_ticket(
             app_name=c["app_name"], app_id=c["app_id"],
@@ -1728,13 +1847,15 @@ async def _handle_existing_secret(
         jira_key = issue.get("issue_key", "")
         if jira_key:
             result["jira_created"] = True
- 
+    elif not jira_key and should_bypass_jira:
+        summary["jiraBypassedPatternCount"] = summary.get("jiraBypassedPatternCount", 0) + 1
+
     jira_open = True
     if jira_key:
         issue_status = await get_jira_issue(jira_key)
         status_name  = (issue_status.get("status") or "").strip().lower()
         jira_open    = status_name not in CLOSED_NAMES
- 
+
     if jira_key and not jira_open:
         closed_ticket_fields = {"ExpiryNotice": notice, "LastChecked": today}
         if c.get("tenant_id"):
@@ -1744,17 +1865,17 @@ async def _handle_existing_secret(
         await write_sharepoint_row(item_id, closed_ticket_fields)
         result["sp_updated"] = True
         return result
- 
+
     current_stage  = BUCKET_STAGE.get(bucket)
     existing_stage = STATUS_STAGE.get(alert_status, 0)
- 
+
     if current_stage is not None and current_stage > existing_stage:
         sev = SEVERITY_MAP[bucket]
- 
+
         # A secret escalating into ANY ticket-eligible bucket (now including
         # P1/P2) for the first time needs a ticket created now, even if it
-        # somehow reached this point with no ticket yet.
-        if not jira_key and bucket in JIRA_TICKET_BUCKETS:
+        # somehow reached this point with no ticket yet (unless matching bypass pattern).
+        if not jira_key and bucket in JIRA_TICKET_BUCKETS and not should_bypass_jira:
             issue = await create_jira_ticket(
                 app_name=c["app_name"], app_id=c["app_id"],
                 secret_id=c["secret_id"], secret_description=c["secret_desc"],
