@@ -1304,6 +1304,15 @@ async def run_secret_monitoring(
             fields["TeamName"]               = lineage["TeamName"]
             fields["ProductName"]            = lineage["ProductName"]
             fields["ProductTeamsKeyVaultName"] = lineage["ProductTeamsKeyVaultName"]
+
+        # DYNAMIC PATTERN ANALYSIS: Auto-enrich metadata for pattern-matching secrets in Second Tenant
+        if should_bypass_jira_for_secret(c, bypass_jira_patterns, bypass_jira_tenants):
+            if not fields.get("TeamName"):
+                fields["TeamName"] = "DevSecOps"
+            if not fields.get("ProductName"):
+                fields["ProductName"] = "PRODUCT-A"
+            if not fields.get("DevSecOpsOwnership"):
+                fields["DevSecOpsOwnership"] = "azure-secretgovernance-cross-tenant"
  
         teams_sent = False
         if bucket in TEAMS_ALERT_BUCKETS:
@@ -1932,6 +1941,15 @@ async def _handle_existing_secret(
         else:
             update_fields["AlertStatus"] = ALERT_STATUS_FOR_BUCKET.get(bucket, "JiraRaised")
  
+        # DYNAMIC PATTERN ANALYSIS: Auto-enrich metadata for pattern-matching secrets in Second Tenant
+        if should_bypass_jira:
+            if not f.get("TeamName"):
+                update_fields["TeamName"] = "DevSecOps"
+            if not f.get("ProductName"):
+                update_fields["ProductName"] = "PRODUCT-A"
+            if not f.get("DevSecOpsOwnership"):
+                update_fields["DevSecOpsOwnership"] = "azure-secretgovernance-cross-tenant"
+
         await write_sharepoint_row(item_id, update_fields)
         result["sp_updated"] = True
  
@@ -1954,6 +1972,16 @@ async def _handle_existing_secret(
         update_fields["ObjectID"] = c.get("app_object_id", "")
         if jira_key:
             update_fields["JiraTicketKey"] = jira_key
+
+        # DYNAMIC PATTERN ANALYSIS: Auto-enrich metadata for pattern-matching secrets in Second Tenant
+        if should_bypass_jira:
+            if not f.get("TeamName"):
+                update_fields["TeamName"] = "DevSecOps"
+            if not f.get("ProductName"):
+                update_fields["ProductName"] = "PRODUCT-A"
+            if not f.get("DevSecOpsOwnership"):
+                update_fields["DevSecOpsOwnership"] = "azure-secretgovernance-cross-tenant"
+
         await write_sharepoint_row(item_id, update_fields)
         result["sp_updated"] = True
  
