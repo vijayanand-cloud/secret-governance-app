@@ -189,7 +189,7 @@ ACTIONABLE_STATUSES        = {
 # to be P5) and must NEVER be rotation-eligible, same as P5 never was under
 # the old scheme.
 ROTATION_ELIGIBLE_BUCKETS  = {"P1", "P2", "P3"}
-DEFAULT_ROTATION_THRESHOLD = 60
+DEFAULT_ROTATION_THRESHOLD = 45
  
 # ─────────────────────────────────────────────────────────────────────────────
 # HTTP HELPER (synchronous urllib — no httpx needed)
@@ -303,10 +303,10 @@ def _classify_bucket(days: int) -> str:
     CORRECTED — matches decision_engine.py's classify_bucket() exactly,
     after the renumbering that merged the old P1 (0-3) and P2 (4-7) into a
     single P1 (0-7), and shifted every bucket below it down by one:
-    P1 0-7 days, P2 8-30 days, P3 31-60 days, P4 61+ days (safe).
+    P1 0-7 days, P2 8-30 days, P3 31-45 days, P4 46+ days (safe).
     """
-    if days >= 61:       return "P4"
-    if 31 <= days <= 60: return "P3"
+    if days >= 46:       return "P4"
+    if 31 <= days <= 45: return "P3"
     if 8  <= days <= 30: return "P2"
     if 0  <= days <= 7:  return "P1"
     if -7 <= days <= -1: return "ExpiredManualReview"
@@ -835,7 +835,7 @@ def main():
              "DevSecOpsOwnership filter, configurable SECRET-VALIDITY-DAYS, "
              "bucket scheme corrected to match decision_engine.py)", started)
  
-    summary = run_secret_rotation(rotation_threshold_days=60)
+    summary = run_secret_rotation(rotation_threshold_days=45)
  
     print("=" * 60)
     print("ROTATION RUNBOOK v3 — SUMMARY")

@@ -399,7 +399,9 @@ async def write_sharepoint_row(item_id: str | None, fields: dict[str, str]) -> d
     # mislabel every row as the home tenant, defeating the whole point of
     # multi-tenant scanning. (TenantName was removed — the column no longer
     # exists in SharePoint.)
-    if not fields.get("TenantID"):
+    # Only default TenantID to home tenant when creating a brand-new row (item_id is None).
+    # On updates/PATCH (item_id is not None), never touch TenantID unless explicitly passed.
+    if item_id is None and not fields.get("TenantID"):
         fields["TenantID"] = GRAPH_TENANT_ID
     headers = {"Authorization": f"Bearer {await _sp_graph_token()}", "Content-Type": "application/json"}
     base = f"https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_SITE_ID}/lists/{SHAREPOINT_LIST_ID}/items"
