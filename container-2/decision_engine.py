@@ -1793,7 +1793,7 @@ async def _handle_existing_secret(
         update_fields["ObjectID"] = c.get("app_object_id", "")
         if jira_key:
             update_fields["JiraTicketKey"] = jira_key
-            if not f.get("JiraTicketCreatedDate"):
+            if "JiraTicketCreatedDate" not in f:
                 update_fields["JiraTicketCreatedDate"] = today
  
         if bucket in TEAMS_ALERT_BUCKETS:
@@ -1833,8 +1833,6 @@ async def _handle_existing_secret(
         update_fields["ObjectID"] = c.get("app_object_id", "")
         if jira_key:
             update_fields["JiraTicketKey"] = jira_key
-            if not f.get("JiraTicketCreatedDate"):
-                update_fields["JiraTicketCreatedDate"] = today
         await write_sharepoint_row(item_id, update_fields)
         result["sp_updated"] = True
  
