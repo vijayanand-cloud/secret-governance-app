@@ -102,6 +102,67 @@ import asyncio
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Callable, Awaitable
+import fnmatch
+import os
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PATTERN MATCHING RULES: Bypass Jira & Teams
+# ─────────────────────────────────────────────────────────────────────────────
+DEFAULT_BYPASS_JIRA_PATTERNS = [
+    "*.select*",
+    "practice-plus-*",
+    "*partner*",
+]
+
+DEFAULT_PATTERN_BYPASS_TENANTS = [
+    "c721d616-dcf3-4510-9c3e-548bc6c1f628",  # Secondary Tenant ID
+]
+
+def matches_bypass_jira_pattern(display_name: str, patterns: list[str] = None) -> bool:
+    """Checks if secret name matches glob patterns (*.select*, practice-plus-*, etc.)."""
+    if not display_name:
+        return False
+    name = display_name.strip().lower()
+
+    # 1. Read from Environment Variable (comma-separated):
+    if patterns is None:
+        env_patterns = os.environ.get("BYPASS_JIRA_PATTERNS")
+        if env_patterns:
+            patterns = [p.strip() for p in env_patterns.split(",") if p.strip()]
+        else:
+            patterns = DEFAULT_BYPASS_JIRA_PATTERNS
+
+    # 2. Check each pattern:
+    for pat in patterns:
+        pat_clean = pat.strip().lower()
+        if fnmatch.fnmatchcase(name, pat_clean):
+            return True
+        if "*" not in pat_clean and "?" not in pat_clean and pat_clean in name:
+            return True
+    return False
+
+def should_bypass_jira_for_secret(c: dict) -> bool:
+    """
+    Returns True ONLY if BOTH conditions are met:
+      1. Secret originates from the Secondary Tenant.
+      2. Secret description/name matches configured pattern.
+    """
+    tenant_id = (c.get("tenant_id") or c.get("TenantID") or "").strip().lower()
+
+    # Read tenant IDs from env variable (optional) or fallback:
+    env_tenants = os.environ.get("BYPASS_JIRA_TENANT_IDS")
+    if env_tenants:
+        allowed_tenants = [t.strip().lower() for t in env_tenants.split(",") if t.strip()]
+    else:
+        allowed_tenants = [t.lower() for t in DEFAULT_PATTERN_BYPASS_TENANTS]
+    
+    # Rule 1: Must be from Secondary Tenant
+    if tenant_id not in allowed_tenants:
+        return False
+
+    # Rule 2: Must match naming pattern
+    desc = c.get("secret_desc") or c.get("SecretDescription") or ""
+    return matches_bypass_jira_pattern(desc)
  
 # ─────────────────────────────────────────────────────────────────────────────
 # BATCH SETTINGS 1 tune here if throttling occurs
@@ -654,6 +715,7 @@ async def run_secret_monitoring(
         "manuallyRestored": 0,   # NEW - IgnoredSecretRegistry rows manually un-Ignored, moved back to the master list
         "masterListBackedUp": False,   # NEW - SecretAlertRegistry successfully snapshotted before this run touched it
         "ignoredListBackedUp": False,  # NEW - IgnoredSecretRegistry successfully snapshotted before this run touched it
+        "patternBypassed": 0,          # NEW - secrets matching bypass pattern (Jira & Teams bypassed)
         "errors": [],
     }
  
@@ -1099,9 +1161,12 @@ async def run_secret_monitoring(
         if c["bucket"] not in ("P4", "Ignore")
     ]
 
- 
-    jira_bound_new = [c for c in actionable_new if c["bucket"] in JIRA_TICKET_BUCKETS]
-    teams_only_new = [c for c in actionable_new if c["bucket"] not in JIRA_TICKET_BUCKETS]
+    standard_actionable_new = [c for c in actionable_new if not should_bypass_jira_for_secret(c)]
+    pattern_bypassed_new    = [c for c in actionable_new if should_bypass_jira_for_secret(c)]
+    summary["patternBypassed"] += len(pattern_bypassed_new)
+
+    jira_bound_new = [c for c in standard_actionable_new if c["bucket"] in JIRA_TICKET_BUCKETS]
+    teams_only_new = [c for c in standard_actionable_new if c["bucket"] not in JIRA_TICKET_BUCKETS]
  
     async def _create_ticket_for_new(c: dict):
         sev   = SEVERITY_MAP[c["bucket"]]
@@ -1145,8 +1210,13 @@ async def run_secret_monitoring(
         {"c": c, "jira_key": "", "sev": SEVERITY_MAP[c["bucket"]], "error": None}
         for c in teams_only_new
     ]
- 
-    all_new_results = [r for r in jira_results if not isinstance(r, Exception)] + teams_only_results
+
+    pattern_bypassed_results = [
+        {"c": c, "jira_key": "", "sev": SEVERITY_MAP[c["bucket"]], "error": None, "is_pattern": True}
+        for c in pattern_bypassed_new
+    ]
+
+    all_new_results = [r for r in jira_results if not isinstance(r, Exception)] + teams_only_results + pattern_bypassed_results
  
     # ── PHASE 2: Send Teams alerts + write SharePoint rows for new (batched) ──
     async def _write_new_secret(res: dict):
@@ -1190,7 +1260,8 @@ async def run_secret_monitoring(
             fields["ProductTeamsKeyVaultName"] = lineage["ProductTeamsKeyVaultName"]
  
         teams_sent = False
-        if bucket in TEAMS_ALERT_BUCKETS:
+        is_pattern = res.get("is_pattern", False) or should_bypass_jira_for_secret(c)
+        if not is_pattern and bucket in TEAMS_ALERT_BUCKETS:
             try:
                 text        = _teams_text(sev["severity"], c, jira_key)
                 # Whether to tag someone is now a day-count decision WITHIN
@@ -1210,7 +1281,9 @@ async def run_secret_monitoring(
                 fields["AlertStatus"] = ALERT_STATUS_FOR_BUCKET.get(bucket, "JiraRaised")
                 return {"action": "sp_created", "teams": False, "error": f"Teams alert failed: {e}"}
         else:
-            fields["AlertStatus"] = ALERT_STATUS_FOR_BUCKET.get(bucket, "JiraRaised")
+            fields["AlertStatus"] = "Discovered" if is_pattern else ALERT_STATUS_FOR_BUCKET.get(bucket, "JiraRaised")
+            if is_pattern:
+                fields["ExpiryNotice"] = f"{bucket}: Pattern-matched workload (Jira & Teams bypassed)"
  
         try:
             await write_sharepoint_row(None, fields)
@@ -1450,6 +1523,7 @@ async def run_secret_monitoring(
             if res.get("teams_sent"):     summary["newTeamsAlerts"]         += 1
             if res.get("moved_to_ignored"): summary["movedToIgnored"]       += 1
             if res.get("manually_ignored"): summary["manuallyIgnored"]      += 1
+            if res.get("is_pattern"):     summary["patternBypassed"]        += 1
  
 
     # NEW - print a per-tenant breakdown at the end of every run, same spirit
@@ -1483,9 +1557,10 @@ async def _handle_existing_secret(
     alert_status = f.get("AlertStatus", "")
     jira_key     = f.get("JiraTicketKey", "")
     notice       = _expiry_notice(c["days"])
+    is_pattern   = should_bypass_jira_for_secret(c)
     result       = {"sp_updated": False, "jira_created": False,
                     "jira_comment": False, "teams_sent": False,
-                    "moved_to_ignored": False, "error": None}
+                    "moved_to_ignored": False, "is_pattern": is_pattern, "error": None}
 
     # NEW - FEATURE 1: manual master-list -> Ignored trigger. A human can set
     # AlertStatus="Ignored" directly on a SecretAlertRegistry row (as opposed
@@ -1716,7 +1791,7 @@ async def _handle_existing_secret(
     # only fired for P3/P4/ExpiredManualReview, matching the old (wrong)
     # JIRA_TICKET_BUCKETS 1 now that P1/P2 are included, a P1/P2 row that
     # somehow lost/never got its ticket is self-healed here too.
-    if not jira_key and bucket in JIRA_TICKET_BUCKETS and bucket in SEVERITY_MAP:
+    if not is_pattern and not jira_key and bucket in JIRA_TICKET_BUCKETS and bucket in SEVERITY_MAP:
         sev   = SEVERITY_MAP[bucket]
         issue = await create_jira_ticket(
             app_name=c["app_name"], app_id=c["app_id"],
@@ -1748,7 +1823,7 @@ async def _handle_existing_secret(
     current_stage  = BUCKET_STAGE.get(bucket)
     existing_stage = STATUS_STAGE.get(alert_status, 0)
  
-    if current_stage is not None and current_stage > existing_stage:
+    if not is_pattern and current_stage is not None and current_stage > existing_stage:
         sev = SEVERITY_MAP[bucket]
  
         # A secret escalating into ANY ticket-eligible bucket (now including
@@ -1817,9 +1892,16 @@ async def _handle_existing_secret(
     else:
         update_fields = {
             "LastChecked":  today,
-            "ExpiryNotice": notice,
+            "ExpiryNotice": (f"{bucket}: Pattern-matched workload (Jira & Teams bypassed)"
+                             if is_pattern else notice),
             "ExpiryBucket": bucket,
         }
+        if is_pattern:
+            update_fields["AlertStatus"] = "Discovered"
+            if f.get("ExpiryBucket") and f.get("ExpiryBucket") != bucket:
+                existing_history = f.get("AlertHistory", "")
+                new_event        = f"[{today}] Bucket changed to {bucket} (pattern-matched workload, Jira & Teams bypassed)."
+                update_fields["AlertHistory"] = f"{existing_history}\n{new_event}".strip()
         # Re-stamp the correct tenant on every touch, self-healing a blank or
         # wrong TenantID back to what this run's Entra scan actually found for
         # this app, rather than falling through to write_sharepoint_row's own
