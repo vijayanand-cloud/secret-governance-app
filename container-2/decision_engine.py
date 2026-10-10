@@ -108,31 +108,26 @@ import os
 # ─────────────────────────────────────────────────────────────────────────────
 # PATTERN MATCHING RULES: Bypass Jira & Teams
 # ─────────────────────────────────────────────────────────────────────────────
-DEFAULT_BYPASS_JIRA_PATTERNS = [
-    "*.select*",
-    "practice-plus-*",
-    "*partner*",
-]
-
-DEFAULT_PATTERN_BYPASS_TENANTS = [
-    "c721d616-dcf3-4510-9c3e-548bc6c1f628",  # Secondary Tenant ID
-]
-
+# PATTERN MATCHING RULES: Bypass Jira & Teams (Strictly Driven by Environment Variables)
+# ─────────────────────────────────────────────────────────────────────────────
 def matches_bypass_jira_pattern(display_name: str, patterns: list[str] = None) -> bool:
-    """Checks if secret name matches glob patterns (*.select*, practice-plus-*, etc.)."""
+    """Checks if secret name matches glob patterns configured via BYPASS_JIRA_PATTERNS env var."""
     if not display_name:
         return False
     name = display_name.strip().lower()
 
-    # 1. Read from Environment Variable (comma-separated):
+    # Read from Environment Variable (comma-separated):
     if patterns is None:
         env_patterns = os.environ.get("BYPASS_JIRA_PATTERNS")
         if env_patterns:
             patterns = [p.strip() for p in env_patterns.split(",") if p.strip()]
         else:
-            patterns = DEFAULT_BYPASS_JIRA_PATTERNS
+            patterns = []
 
-    # 2. Check each pattern:
+    if not patterns:
+        return False
+
+    # Check each pattern:
     for pat in patterns:
         pat_clean = pat.strip().lower()
         if fnmatch.fnmatchcase(name, pat_clean):
@@ -144,23 +139,21 @@ def matches_bypass_jira_pattern(display_name: str, patterns: list[str] = None) -
 def should_bypass_jira_for_secret(c: dict) -> bool:
     """
     Returns True ONLY if BOTH conditions are met:
-      1. Secret originates from the Secondary Tenant.
-      2. Secret description/name matches configured pattern.
+      1. Secret originates from a tenant configured in BYPASS_JIRA_TENANT_IDS.
+      2. Secret description/name matches a pattern in BYPASS_JIRA_PATTERNS.
+    If either environment variable is not configured, bypass is disabled (fails safe).
     """
-    tenant_id = (c.get("tenant_id") or c.get("TenantID") or "").strip().lower()
-
-    # Read tenant IDs from env variable (optional) or fallback:
     env_tenants = os.environ.get("BYPASS_JIRA_TENANT_IDS")
-    if env_tenants:
-        allowed_tenants = [t.strip().lower() for t in env_tenants.split(",") if t.strip()]
-    else:
-        allowed_tenants = [t.lower() for t in DEFAULT_PATTERN_BYPASS_TENANTS]
-    
-    # Rule 1: Must be from Secondary Tenant
+    if not env_tenants:
+        return False
+    allowed_tenants = [t.strip().lower() for t in env_tenants.split(",") if t.strip()]
+    if not allowed_tenants:
+        return False
+
+    tenant_id = (c.get("tenant_id") or c.get("TenantID") or "").strip().lower()
     if tenant_id not in allowed_tenants:
         return False
 
-    # Rule 2: Must match naming pattern
     desc = c.get("secret_desc") or c.get("SecretDescription") or ""
     return matches_bypass_jira_pattern(desc)
  
