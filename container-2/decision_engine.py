@@ -140,9 +140,12 @@ def should_bypass_jira_for_secret(c: dict) -> bool:
     """
     Returns True ONLY if BOTH conditions are met:
       1. Secret originates from a tenant configured in BYPASS_JIRA_TENANT_IDS.
-      2. Secret description/name matches a pattern in BYPASS_JIRA_PATTERNS.
+      2. Application display name (or secret description) matches a pattern in BYPASS_JIRA_PATTERNS.
     If either environment variable is not configured, bypass is disabled (fails safe).
     """
+    if not isinstance(c, dict):
+        return False
+
     env_tenants = os.environ.get("BYPASS_JIRA_TENANT_IDS")
     if not env_tenants:
         return False
@@ -150,12 +153,32 @@ def should_bypass_jira_for_secret(c: dict) -> bool:
     if not allowed_tenants:
         return False
 
-    tenant_id = (c.get("tenant_id") or c.get("TenantID") or "").strip().lower()
+    tenant_id = (
+        c.get("tenant_id")
+        or c.get("TenantID")
+        or c.get("_sourceTenantId")
+        or c.get("tenantId")
+        or ""
+    ).strip().lower()
     if tenant_id not in allowed_tenants:
         return False
 
-    desc = c.get("secret_desc") or c.get("SecretDescription") or ""
-    return matches_bypass_jira_pattern(desc)
+    app_name = (
+        c.get("app_name")
+        or c.get("AppName")
+        or c.get("displayName")
+        or ""
+    ).strip()
+
+    secret_desc = (
+        c.get("secret_desc")
+        or c.get("SecretDescription")
+        or c.get("secret_display_name")
+        or ""
+    ).strip()
+
+    # Matches if EITHER the Application Display Name OR the Secret Description matches
+    return matches_bypass_jira_pattern(app_name) or matches_bypass_jira_pattern(secret_desc)
  
 # ─────────────────────────────────────────────────────────────────────────────
 # BATCH SETTINGS 1 tune here if throttling occurs
